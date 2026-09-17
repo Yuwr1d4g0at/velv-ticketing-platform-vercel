@@ -5,7 +5,6 @@
 const path = require("path");
 const express = require("express");
 const session = require("express-session");
-const PgSession = require("connect-pg-simple")(session);
 const helmet = require("helmet");
 
 const { attachAgent } = require("./middleware/auth");
@@ -16,7 +15,9 @@ const { renderRichText } = require("./richtext");
 const publicRoutes = require("./routes/public");
 const authRoutes = require("./routes/auth");
 const dashboardRoutes = require("./routes/dashboard");
+const cronRoutes = require("./routes/cron");
 const db = require("./db"); // { prepare, exec, pool } - see src/db/index.js's header comment
+const sessionStore = require("./sessionStore");
 
 if (!process.env.SESSION_SECRET) {
   // The friendly, exit(1)-with-a-message version of this check lives in
@@ -56,9 +57,9 @@ app.use(
     // rather than hand-duplicating that table's shape into scripts/migrate.js.
     // pruneSessionInterval is off deliberately: a setInterval has no home in
     // a serverless function that doesn't stay alive between requests -
-    // expired-session cleanup moves into the Phase 5 periodic-checks cron/
-    // opportunistic-trigger instead of a timer here.
-    store: new PgSession({ pool: db.pool, createTableIfMissing: true, pruneSessionInterval: false }),
+    // expired-session cleanup happens in src/periodicChecks.js instead (see
+    // that file's pruneExpiredSessions, which uses this exact store instance).
+    store: sessionStore,
     name: "velv.sid",
     secret: process.env.SESSION_SECRET,
     resave: false,
@@ -85,6 +86,12 @@ app.get("/healthz", async (req, res) => {
     res.status(503).json({ status: "error", message: err.message });
   }
 });
+
+// Unauthenticated (its own CRON_SECRET bearer-token check lives inside the
+// route itself, not session-based) and mounted before the session/CSRF
+// middleware below for the same reason /healthz is - Vercel Cron's request
+// carries no session cookie.
+app.use("/api/cron", cronRoutes);
 
 app.use(attachAgent(db));
 app.use(csrfToken);

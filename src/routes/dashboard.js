@@ -36,6 +36,7 @@ const directory = require("../directory");
 const assetSync = require("../assetSync");
 const msGraph = require("../msGraph");
 const totp = require("../totp");
+const { triggerOpportunistically } = require("../periodicChecks");
 const {
   SAFE_PREVIEW_TYPES,
   handleUpload,
@@ -299,6 +300,11 @@ async function agentsForBulkAssign(agent) {
 
 router.get("/", async (req, res, next) => {
   try {
+    // Fire-and-forget, never awaited - see src/periodicChecks.js for why this
+    // particular route (the one every agent hits constantly) is where the
+    // opportunistic trigger lives, and why it must never block this response.
+    triggerOpportunistically();
+
     const agent = res.locals.currentAgent;
     const { where, params, filters } = await buildTicketFilter(req.query, agent);
 
