@@ -1,82 +1,163 @@
-// Creates a timestamped, consistent snapshot of the database + a copy of the
-// attachments folder. Safe to run while the app is live: `VACUUM INTO`
-// writes a transactionally-consistent copy even with concurrent writers
-// (that's the whole point of the command - unlike a plain file copy, which
-// could grab the SQLite file mid-write in WAL mode and copy something
-// inconsistent).
+// Creates a timestamped, portable JSON export of every real data table plus
+// a manifest of every file actually stored in Vercel Blob, and writes it to
+// Blob itself (under backups/) - not local disk, since this runs from a
+// Vercel Cron function (see src/routes/cron.js) that has no persistent
+// filesystem to write to, same reasoning as everything else this migration
+// moved off local disk. The old version VACUUM INTO'd a local SQLite file
+// and copied a local attachments/ folder - neither exists anymore.
+//
+// This is a logical (row-level) export, not a binary pg_dump - no pg_dump
+// binary is available in a Vercel Function's runtime anyway, and a portable
+// JSON snapshot restorable with nothing but this app's own tooling
+// (scripts/restore.js) is arguably more useful for disaster recovery than a
+// provider-specific binary format. Attachment *bytes* are deliberately not
+// duplicated into the backup - Vercel Blob already provides its own
+// durability guarantees, so this only records what exists and where
+// (pathname/size/uploadedAt) for cross-checking against the attachments
+// table's own rows, not a second copy of every file's bytes on every run.
 //
 // Run manually:      npm run backup
-// Run on a schedule:  add a cron entry, e.g. a nightly one:
-//   0 3 * * * cd /path/to/app && /usr/bin/npm run backup >> logs/backup.log 2>&1
+// Run on a schedule: see vercel.json's crons entry (Hobby plan allows up to
+//   100 cron jobs/project, once per day each, +-59min precision - see
+//   https://vercel.com/docs/cron-jobs/usage-and-pricing).
+// Restore:            npm run restore -- <backup pathname or "latest">
+//   (see scripts/restore.js and the README's Backups section)
 require("dotenv").config();
-const path = require("path");
-const fs = require("fs");
-const { DatabaseSync } = require("node:sqlite");
+const { put, list, del } = require("@vercel/blob");
+const db = require("../src/db");
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "data", "tickets.sqlite");
-const DATA_DIR = path.dirname(DB_PATH);
-const ATTACHMENTS_DIR = path.join(DATA_DIR, "attachments");
-const BACKUP_ROOT = process.env.BACKUP_DIR || path.join(DATA_DIR, "backups");
+// Overridable so the test suite can point backups at a throwaway prefix
+// instead of mixing test runs into the real backups/ used by production -
+// this shares one Vercel Blob store across dev/test/prod (there's no
+// separate token per environment the way DATABASE_URL has velv_test), so
+// without this a test run's aggressive BACKUP_KEEP pruning could delete
+// real production backups sitting under the same prefix.
+const BACKUP_PREFIX = process.env.BACKUP_PREFIX || "backups/";
 const KEEP = parseInt(process.env.BACKUP_KEEP, 10) || 14; // backups to retain; oldest pruned first
 
-function runBackup() {
-  if (!fs.existsSync(DB_PATH)) {
-    throw new Error(`No database found at ${DB_PATH} - nothing to back up.`);
-  }
+// Every real application table, in the same dependency order
+// scripts/migrate.js creates them in (a child table always appears after
+// the parent(s) its foreign keys point at) - scripts/restore.js inserts in
+// this exact order so FK constraints are satisfied without having to defer
+// them. Two deliberate exclusions:
+// - `session` (connect-pg-simple's own store) - ephemeral login state, not
+//   data anyone's disaster-recovery plan should depend on, and restoring it
+//   would just log every agent out anyway.
+// - `directory_cache` (src/directory.js) - a pure, self-healing Microsoft
+//   Graph lookup cache with a 24-hour TTL, no authoritative data of its
+//   own; also holds photo_blob as raw BYTEA, which doesn't round-trip
+//   through JSON.stringify/parse the way every other column here does.
+const TABLES = [
+  "departments",
+  "agents",
+  "categories",
+  "assets",
+  "tickets",
+  "ticket_activity",
+  "attachments",
+  "tags",
+  "ticket_tags",
+  "ticket_ratings",
+  "canned_responses",
+  "asset_activity",
+  "saved_views",
+  "sla_thresholds",
+  "webhooks",
+  "login_log",
+  "kb_articles",
+  "ticket_templates",
+  "ticket_watchers",
+  "custom_field_definitions",
+  "ticket_custom_values",
+  "ticket_links",
+  "automation_rules",
+  "recurring_tickets",
+  "notifications",
+  "first_response_thresholds",
+  "company_holidays",
+  "time_entries",
+  "asset_sync_runs",
+  "template_checklist_items",
+  "agent_activity",
+  "periodic_check_state",
+];
 
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const backupDir = path.join(BACKUP_ROOT, stamp);
-  fs.mkdirSync(backupDir, { recursive: true });
-
-  const dbBackupPath = path.join(backupDir, "tickets.sqlite");
-  const db = new DatabaseSync(DB_PATH);
-  try {
-    // Path is server-derived (from DB_PATH/BACKUP_DIR env config, never
-    // request input), so inlining it is safe - VACUUM INTO doesn't support
-    // parameter binding for its destination anyway. Single-quote-escaped in
-    // case a configured path happens to contain one.
-    db.exec(`VACUUM INTO '${dbBackupPath.replace(/'/g, "''")}'`);
-  } finally {
-    db.close();
-  }
-
-  let attachmentCount = 0;
-  if (fs.existsSync(ATTACHMENTS_DIR)) {
-    const dest = path.join(backupDir, "attachments");
-    fs.cpSync(ATTACHMENTS_DIR, dest, { recursive: true });
-    attachmentCount = fs.readdirSync(dest).length;
-  }
-
-  const pruned = pruneOldBackups();
-
-  return { backupDir, attachmentCount, pruned };
+// Every blob actually in the store right now, excluding backups/ itself -
+// list() is paginated (1000/page), so this loops on the cursor until
+// hasMore is false rather than assuming one call sees everything.
+async function listAllBlobs() {
+  const blobs = [];
+  let cursor;
+  do {
+    const page = await list({ cursor, limit: 1000 });
+    for (const blob of page.blobs) {
+      if (!blob.pathname.startsWith(BACKUP_PREFIX)) blobs.push(blob);
+    }
+    cursor = page.hasMore ? page.cursor : undefined;
+  } while (cursor);
+  return blobs;
 }
 
-function pruneOldBackups() {
-  if (!fs.existsSync(BACKUP_ROOT)) return [];
-  const entries = fs
-    .readdirSync(BACKUP_ROOT)
-    .filter((f) => fs.statSync(path.join(BACKUP_ROOT, f)).isDirectory())
-    .sort(); // ISO timestamp names sort chronologically
-
-  const pruned = [];
-  while (entries.length > KEEP) {
-    const oldest = entries.shift();
-    fs.rmSync(path.join(BACKUP_ROOT, oldest), { recursive: true, force: true });
-    pruned.push(oldest);
+async function runBackup() {
+  const tables = {};
+  for (const table of TABLES) {
+    tables[table] = await db.prepare(`SELECT * FROM "${table}"`).all();
   }
-  return pruned;
+
+  const blobManifest = (await listAllBlobs()).map((b) => ({
+    pathname: b.pathname,
+    size: b.size,
+    uploadedAt: b.uploadedAt,
+  }));
+
+  const payload = {
+    createdAt: new Date().toISOString(),
+    tables: TABLES,
+    rowCounts: Object.fromEntries(TABLES.map((t) => [t, tables[t].length])),
+    data: tables,
+    blobManifest,
+  };
+
+  const pathname = `${BACKUP_PREFIX}${payload.createdAt.replace(/[:.]/g, "-")}.json`;
+  await put(pathname, JSON.stringify(payload), { access: "private", contentType: "application/json", addRandomSuffix: false });
+
+  const pruned = await pruneOldBackups();
+
+  return {
+    pathname,
+    rowCounts: payload.rowCounts,
+    attachmentCount: blobManifest.length,
+    pruned,
+  };
+}
+
+async function pruneOldBackups() {
+  const backups = [];
+  let cursor;
+  do {
+    const page = await list({ prefix: BACKUP_PREFIX, cursor, limit: 1000 });
+    backups.push(...page.blobs);
+    cursor = page.hasMore ? page.cursor : undefined;
+  } while (cursor);
+
+  backups.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+  const toDelete = backups.slice(KEEP);
+  if (toDelete.length) await del(toDelete.map((b) => b.pathname));
+  return toDelete.map((b) => b.pathname);
 }
 
 if (require.main === module) {
-  try {
-    const { backupDir, attachmentCount, pruned } = runBackup();
-    console.log(`Backup written to ${backupDir} (${attachmentCount} attachment file(s)).`);
-    if (pruned.length) console.log(`Pruned ${pruned.length} old backup(s): ${pruned.join(", ")}`);
-  } catch (err) {
-    console.error("Backup failed:", err.message);
-    process.exit(1);
-  }
+  runBackup()
+    .then(({ pathname, rowCounts, attachmentCount, pruned }) => {
+      const totalRows = Object.values(rowCounts).reduce((a, b) => a + b, 0);
+      console.log(`Backup written to ${pathname} (${totalRows} row(s) across ${TABLES.length} tables, ${attachmentCount} attachment(s) in the manifest).`);
+      if (pruned.length) console.log(`Pruned ${pruned.length} old backup(s): ${pruned.join(", ")}`);
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error("Backup failed:", err.message);
+      process.exit(1);
+    });
 }
 
-module.exports = { runBackup, BACKUP_ROOT, KEEP };
+module.exports = { runBackup, TABLES, BACKUP_PREFIX, KEEP };

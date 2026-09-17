@@ -202,20 +202,43 @@ uploader, and whether the requester can see it kept in the database.
 npm run backup
 ```
 
-Writes a timestamped, consistent snapshot of the database (via SQLite's
-`VACUUM INTO` — safe to run while the app is live, unlike a plain file copy)
-plus a copy of `data/attachments/` to `data/backups/<timestamp>/`. A copy of
-one without the other leaves either orphaned files or attachment rows with
-nothing to download, so the script always takes both together. Keeps the 14
+Writes a timestamped JSON export of every real data table (see
+`scripts/backup.js`'s `TABLES` list — everything except `session`, which is
+ephemeral login state, and `directory_cache`, a self-healing 24h cache) plus
+a manifest of every attachment currently in Vercel Blob (pathname/size/
+upload time, not the file bytes themselves — Blob already handles its own
+durability, so a backup only needs to record what exists and where). The
+whole thing is written to Blob itself, under `backups/`, since this runs
+from a Vercel Function with no persistent disk to write to. Keeps the 14
 most recent backups by default and prunes older ones — override with
-`BACKUP_DIR` / `BACKUP_KEEP` in `.env`.
+`BACKUP_KEEP` in `.env`.
 
-Not scheduled on its own; add a cron entry to actually run it automatically,
-e.g. nightly at 3am:
+Runs nightly at 3am UTC via Vercel Cron (`vercel.json`'s `crons` entry hits
+`/api/cron/backup`, gated by `CRON_SECRET` the same way
+`/api/cron/periodic-checks` is) — no separate scheduling setup needed once
+deployed. Run it manually any time with the command above.
 
+#### Restoring from a backup
+
+```bash
+npm run restore -- latest --yes
+# or a specific one:
+npm run restore -- backups/2026-01-15T03-00-00-000Z.json --yes
 ```
-0 3 * * * cd /path/to/app && /usr/bin/npm run backup >> logs/backup.log 2>&1
-```
+
+**Destructive** — truncates every table the backup covers and replaces it
+with that snapshot's rows, inside one transaction (all-or-nothing: a failure
+partway through rolls the whole thing back rather than leaving a
+half-restored database). Refuses to run without `--yes`. Fixes up each
+table's auto-increment sequence afterward so new rows don't collide with
+restored ids.
+
+Attachment file bytes are never touched by a restore — they were never
+duplicated into the backup in the first place (see above), so a restore
+brings the database back but leaves Blob exactly as it was. If a restored
+`attachments` row points at a Blob pathname that's since been deleted,
+that's the same "orphaned reference" situation as any other point-in-time
+database restore and isn't something this script tries to reconcile.
 
 ## Deploying
 

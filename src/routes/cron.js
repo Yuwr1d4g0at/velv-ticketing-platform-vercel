@@ -5,6 +5,7 @@
 // real dashboard traffic instead).
 const express = require("express");
 const { runPeriodicChecks } = require("../periodicChecks");
+const { runBackup } = require("../../scripts/backup");
 
 const router = express.Router();
 
@@ -23,6 +24,24 @@ router.get("/periodic-checks", async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error("Cron periodic-checks run failed:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Same CRON_SECRET gate as above - see scripts/backup.js for what this
+// actually exports (a JSON snapshot of every table + a Blob file manifest,
+// written to Blob itself since a Vercel Function has no persistent disk).
+router.get("/backup", async (req, res) => {
+  const expected = `Bearer ${process.env.CRON_SECRET || ""}`;
+  if (!process.env.CRON_SECRET || req.headers.authorization !== expected) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    const result = await runBackup();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("Cron backup run failed:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
