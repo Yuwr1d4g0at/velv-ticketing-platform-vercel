@@ -21,7 +21,21 @@ const db = require("./db");
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "data", "tickets.sqlite");
 const ATTACHMENTS_DIR = path.join(path.dirname(DB_PATH), "attachments");
-fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+// On Vercel, the deployed bundle (where this path resolves to by default)
+// is a read-only filesystem - only /tmp is writable, and even that is
+// ephemeral per-instance, not shared across invocations. This mkdirSync is
+// a load-time side effect (require("./attachments") runs it immediately),
+// so throwing here would crash EVERY route in the app, not just uploads -
+// caught and logged instead of left to take down the whole process.
+// Attachments genuinely don't work yet in that environment either way
+// (local disk storage was never going to survive a serverless redeploy) -
+// migrating this to Vercel Blob is tracked separately, not silently
+// worked around here by writing to /tmp.
+try {
+  fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+} catch (err) {
+  console.error(`Could not create attachments directory at ${ATTACHMENTS_DIR}: ${err.message}`);
+}
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10 MB per file
 const MAX_FILES = 3; // per upload action (a new ticket, or one note)
