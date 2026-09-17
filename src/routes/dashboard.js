@@ -207,29 +207,46 @@ async function ticketTimingStats(agent) {
   return { resolutionTime, firstResponseTime };
 }
 
-// Duplicate detection used to run against SQLite FTS5 (tickets_fts,
-// bm25() ranking) - Postgres full-text search (tsvector/ts_rank) is Phase 4
-// work, not bundled into this async-adapter pass. For now this falls back
-// to a plain LIKE-per-token OR scan, still ranked by number of matching
-// tokens (a cruder proxy for relevance than bm25, but keeps the feature
-// working rather than removing it until Phase 4 lands).
+// Postgres analogue of the old buildFtsQuery() this app used against SQLite
+// FTS5 (removed when this file first ported to the async adapter, since FTS5
+// itself has no Postgres equivalent - Phase 4 work, now done). Each token
+// becomes a prefix-matched lexeme (":*", the same "keyb finds keyboard"
+// behavior FTS5's own trailing "*" gave); `joiner` is " & " (AND - every word
+// must appear somewhere in the ticket, used for the main ticket-list search
+// below) or " | " (OR - any word overlapping is enough, used for duplicate
+// detection, where two people describing the same issue in their own words
+// rarely share every word). Tokens are restricted to \p{L}\p{N} characters by
+// the regex, so the built string is always a syntactically valid
+// to_tsquery() input - never raw user text passed through unescaped.
+function buildTsQuery(text, joiner) {
+  const tokens = text.match(/[\p{L}\p{N}]+/gu) || [];
+  if (!tokens.length) return null;
+  return tokens.map((t) => `${t}:*`).join(joiner);
+}
+
+// Other still-open tickets whose subject shares words with this one - shown
+// as a "Possible duplicates" card on the ticket detail page, with a
+// one-click way into the existing merge flow. Deliberately scoped to
+// Open/In Progress tickets only (merging into something already Resolved/
+// Closed isn't the useful case this is for) and excludes anything already
+// merged away. Ranked by ts_rank against tickets.search_vector (see
+// scripts/migrate.js) - ranking necessarily differs from FTS5's old bm25(),
+// a known, accepted tradeoff, not a bug to chase parity on.
 async function findPossibleDuplicates(agent, ticket) {
   const tokens = (ticket.subject.match(/[\p{L}\p{N}]+/gu) || []).filter((t) => t.length >= 3);
   if (!tokens.length) return [];
+  const tsQuery = tokens.map((t) => `${t}:*`).join(" | ");
   const vis = departments.ticketVisibilitySql(agent);
-  const likeClauses = tokens.map(() => "tickets.subject ILIKE ?").join(" OR ");
-  const likeParams = tokens.map((t) => `%${t}%`);
-  const rankExpr = tokens.map(() => "(CASE WHEN tickets.subject ILIKE ? THEN 1 ELSE 0 END)").join(" + ");
   return db
     .prepare(
       `SELECT tickets.id, tickets.subject, tickets.status, tickets.created_at
        FROM tickets
-       WHERE (${likeClauses}) AND tickets.id != ? AND tickets.merged_into_id IS NULL
+       WHERE tickets.search_vector @@ to_tsquery('english', ?) AND tickets.id != ? AND tickets.merged_into_id IS NULL
          AND tickets.status IN ('Open', 'In Progress')${vis.sql}
-       ORDER BY (${rankExpr}) DESC
+       ORDER BY ts_rank(tickets.search_vector, to_tsquery('english', ?)) DESC
        LIMIT 3`
     )
-    .all(...likeParams, ticket.id, ...vis.params, ...likeParams);
+    .all(tsQuery, ticket.id, ...vis.params, tsQuery);
 }
 
 // Shared by the ticket list, its pagination count, and the CSV export, so the
@@ -238,11 +255,12 @@ async function findPossibleDuplicates(agent, ticket) {
 // visibility restriction (departments.ticketVisibilitySql) - there is no
 // filter combination, including an empty one, that bypasses it.
 //
-// Free-text search (`q`) used SQLite FTS5 (buildFtsQuery/tickets_fts) -
-// Postgres full-text search is Phase 4 work, not bundled into this
-// async-adapter pass. Falls back to a plain (I)LIKE-both-sides search
-// against subject/description in the meantime, still fine for this app's
-// scale.
+// Free-text search (`q`) runs against tickets.search_vector (see
+// scripts/migrate.js and buildTsQuery above) - a multi-word search requires
+// every word to appear somewhere in the subject/description (AND-joined),
+// same as the old FTS5-backed search did. requester_name/email are matched
+// separately with a plain ILIKE, same as before - they were never part of
+// the FTS index either.
 async function buildTicketFilter(query, agent) {
   const { status = "", priority = "", category = "", assigned = "", tag = "", q = "" } = query;
   const vis = departments.ticketVisibilitySql(agent);
@@ -275,9 +293,15 @@ async function buildTicketFilter(query, agent) {
     params.push(tag.trim());
   }
   if (q.trim()) {
+    const tsQuery = buildTsQuery(q, " & ");
     const like = `%${q.trim()}%`;
-    where += " AND (tickets.subject ILIKE ? OR tickets.description ILIKE ? OR tickets.requester_name ILIKE ? OR tickets.requester_email ILIKE ?)";
-    params.push(like, like, like, like);
+    if (tsQuery) {
+      where += " AND (tickets.search_vector @@ to_tsquery('english', ?) OR tickets.requester_name ILIKE ? OR tickets.requester_email ILIKE ?)";
+      params.push(tsQuery, like, like);
+    } else {
+      where += " AND (tickets.requester_name ILIKE ? OR tickets.requester_email ILIKE ?)";
+      params.push(like, like);
+    }
   }
 
   return { where, params, filters: { status, priority, category, assigned, tag, q } };

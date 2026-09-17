@@ -147,10 +147,27 @@ const SCHEMA_SQL = `
     approval_status           TEXT,
     approval_note             TEXT,
     reminder_date             TEXT,
-    reminder_alerted_at       TEXT
+    reminder_alerted_at       TEXT,
+    -- Postgres tsvector/ts_rank full-text search (Phase 4) - the direct
+    -- replacement for SQLite's tickets_fts virtual table + its
+    -- AFTER-INSERT/UPDATE/DELETE triggers (see the old src/db/index.js).
+    -- GENERATED ALWAYS ... STORED keeps this in sync automatically on every
+    -- INSERT/UPDATE with no trigger of our own needed - Postgres recomputes
+    -- it as part of the same row write. subject is weighted 'A' (highest)
+    -- over description's 'B' so a subject-word match ranks above a
+    -- description-only match, same relative priority FTS5's own column
+    -- weighting gave subject in practice (searches that only matched deep in
+    -- a long description felt like weaker hits). Ranking behavior
+    -- necessarily differs from FTS5's bm25() - a known, accepted tradeoff
+    -- from the original migration plan, not a bug to chase parity on.
+    search_vector TSVECTOR GENERATED ALWAYS AS (
+      setweight(to_tsvector('english', coalesce(subject, '')), 'A') ||
+      setweight(to_tsvector('english', coalesce(description, '')), 'B')
+    ) STORED
   );
   CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
   CREATE INDEX IF NOT EXISTS idx_tickets_assigned_to ON tickets(assigned_to);
+  CREATE INDEX IF NOT EXISTS idx_tickets_search_vector ON tickets USING GIN(search_vector);
 
   CREATE TABLE IF NOT EXISTS ticket_activity (
     id         SERIAL PRIMARY KEY,
@@ -423,6 +440,19 @@ async function migrate() {
   try {
     await client.query(NOW_TEXT_FUNCTION_SQL);
     await client.query(SCHEMA_SQL);
+
+    // Patches applied on top of SCHEMA_SQL for a database that already had
+    // its tables created by an earlier run of this script - CREATE TABLE IF
+    // NOT EXISTS above only defines a new column's shape for a genuinely
+    // fresh install, it does nothing to a tickets table that already
+    // existed before search_vector was added to that CREATE TABLE.
+    await client.query(`
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS search_vector TSVECTOR GENERATED ALWAYS AS (
+        setweight(to_tsvector('english', coalesce(subject, '')), 'A') ||
+        setweight(to_tsvector('english', coalesce(description, '')), 'B')
+      ) STORED;
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_tickets_search_vector ON tickets USING GIN(search_vector);`);
 
     // Same seed-if-empty data as the old src/db/index.js - historical
     // defaults, never re-applied once a real row exists.
