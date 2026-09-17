@@ -8,6 +8,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "seed": "node src/db/seed.js",
+    "migrate": "node scripts/migrate.js",
     "backup": "node scripts/backup.js",
     "test": "node --test"
   },
@@ -15,7 +16,10 @@
     "node": ">=22.5.0"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^0.10.4",
+    "@vercel/blob": "^2.8.0",
     "bcryptjs": "^2.4.3",
+    "connect-pg-simple": "^10.0.0",
     "dotenv": "^16.4.5",
     "ejs": "^3.1.10",
     "express": "^4.21.0",

@@ -7,3 +7,5 @@ data/backups/
 logs/
 *.log
 .DS_Store
+.vercel
+.env*

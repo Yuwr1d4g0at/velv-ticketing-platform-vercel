@@ -5,6 +5,7 @@
 const path = require("path");
 const express = require("express");
 const session = require("express-session");
+const PgSession = require("connect-pg-simple")(session);
 const helmet = require("helmet");
 
 const { attachAgent } = require("./middleware/auth");
@@ -15,8 +16,7 @@ const { renderRichText } = require("./richtext");
 const publicRoutes = require("./routes/public");
 const authRoutes = require("./routes/auth");
 const dashboardRoutes = require("./routes/dashboard");
-const db = require("./db"); // ensures schema is created before the app is used
-const SqliteSessionStore = require("./session-store");
+const db = require("./db"); // { prepare, exec, pool } - see src/db/index.js's header comment
 
 if (!process.env.SESSION_SECRET) {
   // The friendly, exit(1)-with-a-message version of this check lives in
@@ -50,7 +50,15 @@ app.use(express.static(path.join(__dirname, "..", "public")));
 
 app.use(
   session({
-    store: new SqliteSessionStore(),
+    // connect-pg-simple against the same Neon pool db/index.js already
+    // holds - replaces the old custom SqliteSessionStore. createTableIfMissing
+    // creates+indexes its own "session" table the first time it's needed,
+    // rather than hand-duplicating that table's shape into scripts/migrate.js.
+    // pruneSessionInterval is off deliberately: a setInterval has no home in
+    // a serverless function that doesn't stay alive between requests -
+    // expired-session cleanup moves into the Phase 5 periodic-checks cron/
+    // opportunistic-trigger instead of a timer here.
+    store: new PgSession({ pool: db.pool, createTableIfMissing: true, pruneSessionInterval: false }),
     name: "velv.sid",
     secret: process.env.SESSION_SECRET,
     resave: false,
@@ -66,9 +74,12 @@ app.use(
 
 // Unauthenticated on purpose - a host or uptime monitor polling this has no
 // way to log in. Checks real DB connectivity, not just "the process is up".
-app.get("/healthz", (req, res) => {
+// One of the few routes touched directly in Phase 0 (not deferred to Phase
+// 1/2's full async port) - it's the one health-check needed to confirm the
+// Postgres connection actually works at all.
+app.get("/healthz", async (req, res) => {
   try {
-    db.prepare("SELECT 1").get();
+    await db.prepare("SELECT 1").get();
     res.status(200).json({ status: "ok" });
   } catch (err) {
     res.status(503).json({ status: "error", message: err.message });
