@@ -1,11 +1,13 @@
 // File attachments for tickets: upload handling, storage, and lookup helpers.
 //
-// Security notes (this is the one part of the app that touches the filesystem
-// with user-supplied content, so it gets extra care):
-//   - On-disk filenames are always server-generated random hex + an extension
-//     from ALLOWED_TYPES below - never derived from the uploaded filename. That
-//     rules out path traversal and disguising an executable with a safe-looking
-//     name; the user's original filename is kept only as a DB column for display.
+// Security notes (this is the one part of the app that touches user-supplied
+// binary content, so it gets extra care):
+//   - Blob pathnames (stored in `stored_name`, unchanged column name from the
+//     local-disk era - see below) are always server-generated random hex + an
+//     extension from ALLOWED_TYPES - never derived from the uploaded filename.
+//     That rules out path traversal and disguising an executable with a
+//     safe-looking name; the user's original filename is kept only as a DB
+//     column for display.
 //   - Only a fixed allowlist of mime types can be uploaded (images, PDF, plain
 //     text, CSV). Notably no .svg or .html - both can carry a <script>, and
 //     serving one back would be a stored-XSS hole.
@@ -13,29 +15,23 @@
 //     a mislabeled file gets saved to disk rather than rendered/executed by the
 //     browser. That means no inline image thumbnails, which is a fair trade for
 //     one less thing that has to be airtight.
-const path = require("path");
-const fs = require("fs");
+//
+// Storage: Vercel Blob (private access), not local disk - Phase 3 of the
+// Railway->Vercel migration. Local disk never survives a serverless
+// redeploy/cold start, and the deployed bundle's filesystem is read-only
+// anyway (see the git history for the crash this caused before this file was
+// ported). `stored_name` keeps its old column name/meaning of "the opaque
+// name this file is stored under" - it's now a Blob pathname instead of a
+// local filename, so every existing DB row and every download/preview call
+// site only needed a storage-layer swap, not a schema change: blob.get()
+// resolves a blob by pathname alone (using BLOB_READ_WRITE_TOKEN to find the
+// right store), the same way fs used to resolve a filename against
+// ATTACHMENTS_DIR.
 const crypto = require("crypto");
+const { Readable } = require("stream");
 const multer = require("multer");
+const { put, get: blobGet, del: blobDel } = require("@vercel/blob");
 const db = require("./db");
-
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "data", "tickets.sqlite");
-const ATTACHMENTS_DIR = path.join(path.dirname(DB_PATH), "attachments");
-// On Vercel, the deployed bundle (where this path resolves to by default)
-// is a read-only filesystem - only /tmp is writable, and even that is
-// ephemeral per-instance, not shared across invocations. This mkdirSync is
-// a load-time side effect (require("./attachments") runs it immediately),
-// so throwing here would crash EVERY route in the app, not just uploads -
-// caught and logged instead of left to take down the whole process.
-// Attachments genuinely don't work yet in that environment either way
-// (local disk storage was never going to survive a serverless redeploy) -
-// migrating this to Vercel Blob is tracked separately, not silently
-// worked around here by writing to /tmp.
-try {
-  fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
-} catch (err) {
-  console.error(`Could not create attachments directory at ${ATTACHMENTS_DIR}: ${err.message}`);
-}
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10 MB per file
 const MAX_FILES = 3; // per upload action (a new ticket, or one note)
@@ -57,13 +53,12 @@ const ALLOWED_TYPES = {
 // own claimed mime_type at serve time.
 const SAFE_PREVIEW_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, ATTACHMENTS_DIR),
-  filename: (req, file, cb) => {
-    const ext = ALLOWED_TYPES[file.mimetype] || "";
-    cb(null, `${crypto.randomBytes(24).toString("hex")}${ext}`);
-  },
-});
+// memoryStorage, not diskStorage - files live only as an in-memory Buffer
+// (file.buffer) between multer parsing the upload and saveAttachments()
+// below uploading that buffer to Blob. Fine at this app's MAX_FILE_BYTES/
+// MAX_FILES scale (30 MB worst case per request), well within a serverless
+// function's memory budget.
+const storage = multer.memoryStorage();
 
 const multerUpload = multer({
   storage,
@@ -80,18 +75,15 @@ const LIMITS_HINT = `Optional, up to ${MAX_FILES} files, ${MAX_FILE_BYTES / (102
 
 // Wraps multer so a bad upload (wrong type, too big, too many files) turns into
 // a friendly `req.uploadError` string instead of a thrown error - the caller
-// re-renders the same form with it, same as any other validation error. Also
-// cleans up any files multer already wrote to disk before it hit the error,
-// so a rejected request never leaves orphaned files behind.
+// re-renders the same form with it, same as any other validation error. With
+// memoryStorage there's nothing on disk to clean up on a rejected upload (no
+// deleteUploadedFiles() call needed here anymore - see that function's note
+// below).
 function handleUpload(fieldName) {
   const middleware = multerUpload.array(fieldName, MAX_FILES);
   return (req, res, next) => {
     middleware(req, res, (err) => {
       if (!err) return next();
-
-      for (const file of req.files || []) {
-        fs.unlink(file.path, () => {});
-      }
 
       if (err.code === "LIMIT_FILE_SIZE") {
         req.uploadError = `Each file must be under ${MAX_FILE_BYTES / (1024 * 1024)} MB.`;
@@ -112,12 +104,6 @@ function handleUpload(fieldName) {
 // attached to a note explicitly marked "visible to requester" - otherwise an
 // agent could attach something meant to stay internal to an otherwise-
 // internal note and have it leak via /status anyway.
-// Ported to the async Postgres adapter (see src/db/index.js) - this is the
-// one DB call site in this file. The multer diskStorage setup above is
-// UNCHANGED for now (still local disk, still reads DB_PATH which no longer
-// exists in .env.example - falls back to its own hardcoded default, fine
-// for local dev/testing) - swapping this for Vercel Blob is Phase 3's job,
-// deliberately not bundled into this async-adapter pass.
 async function saveAttachments({ ticketId, files, uploadedBy, agentId = null, visibleToRequester = true }) {
   if (!files || !files.length) return [];
   const insert = db.prepare(
@@ -126,9 +112,12 @@ async function saveAttachments({ ticketId, files, uploadedBy, agentId = null, vi
   );
   return Promise.all(
     files.map(async (file) => {
+      const ext = ALLOWED_TYPES[file.mimetype] || "";
+      const pathname = `${crypto.randomBytes(24).toString("hex")}${ext}`;
+      await put(pathname, file.buffer, { access: "private", contentType: file.mimetype, addRandomSuffix: false });
       const result = await insert.run(
         ticketId,
-        file.filename,
+        pathname,
         file.originalname.slice(0, 200),
         file.mimetype,
         file.size,
@@ -141,11 +130,13 @@ async function saveAttachments({ ticketId, files, uploadedBy, agentId = null, vi
   );
 }
 
-function deleteUploadedFiles(files) {
-  for (const file of files || []) {
-    fs.unlink(file.path, () => {});
-  }
-}
+// With memoryStorage, multer never writes anything to disk in the first
+// place - a rejected upload just means the in-memory buffers get garbage
+// collected once the request ends, nothing to explicitly delete. Kept as a
+// no-op (rather than removed) so every existing call site (form validation
+// failures in dashboard.js/public.js that call this after req.uploadError or
+// a body/length check fails) doesn't need its own conditional.
+function deleteUploadedFiles() {}
 
 // requesterVisibleOnly: true for anything rendered on a public (/status)
 // page - false (the default) for the dashboard, where agents see everything
@@ -176,6 +167,30 @@ async function getPublicAttachment(ticketId, attachmentId) {
   return db.prepare("SELECT * FROM attachments WHERE id = ? AND ticket_id = ? AND visible_to_requester = 1").get(attachmentId, ticketId);
 }
 
+// Streams an attachment's bytes from Blob storage through this server (never
+// redirects the browser straight to the Blob URL) - the private-access Blob
+// store requires the server's own BLOB_READ_WRITE_TOKEN to read it anyway,
+// but doing this server-side also means every existing access-control check
+// (agent session, ticket ownership, visible_to_requester, SAFE_PREVIEW_TYPES)
+// still gates the actual bytes, exactly as it did when this read from local
+// disk. `disposition` is "attachment" (force-download) or "inline" (preview).
+async function streamAttachment(res, attachment, disposition) {
+  const result = await blobGet(attachment.stored_name, { access: "private" });
+  if (!result || !result.stream) {
+    return res.status(404).render("error", { title: "Not found", message: "That attachment's file could not be found." });
+  }
+  res.setHeader("Content-Type", attachment.mime_type);
+  res.setHeader(
+    "Content-Disposition",
+    `${disposition}; filename="${attachment.original_name.replace(/"/g, "")}"; filename*=UTF-8''${encodeURIComponent(attachment.original_name)}`
+  );
+  Readable.fromWeb(result.stream).pipe(res);
+}
+
+async function deleteAttachmentBlob(storedName) {
+  await blobDel(storedName, { access: "private" }).catch((err) => console.error(`Could not delete blob ${storedName}:`, err.message));
+}
+
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -183,7 +198,6 @@ function formatSize(bytes) {
 }
 
 module.exports = {
-  ATTACHMENTS_DIR,
   MAX_FILE_BYTES,
   MAX_FILES,
   LIMITS_HINT,
@@ -194,5 +208,7 @@ module.exports = {
   attachmentsForTicket,
   getAttachment,
   getPublicAttachment,
+  streamAttachment,
+  deleteAttachmentBlob,
   formatSize,
 };

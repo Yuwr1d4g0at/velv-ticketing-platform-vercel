@@ -1,5 +1,4 @@
 const express = require("express");
-const path = require("path");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const db = require("../db");
@@ -38,13 +37,13 @@ const assetSync = require("../assetSync");
 const msGraph = require("../msGraph");
 const totp = require("../totp");
 const {
-  ATTACHMENTS_DIR,
   SAFE_PREVIEW_TYPES,
   handleUpload,
   saveAttachments,
   deleteUploadedFiles,
   attachmentsForTicket,
   getAttachment,
+  streamAttachment,
   formatSize,
   LIMITS_HINT,
 } = require("../attachments");
@@ -982,9 +981,7 @@ router.get("/tickets/:id/attachments/:attachmentId/preview", async (req, res, ne
     if (!attachment || !SAFE_PREVIEW_TYPES.has(attachment.mime_type)) {
       return res.status(404).render("error", { title: "Not found", message: "No preview is available for that attachment." });
     }
-    res.setHeader("Content-Type", attachment.mime_type);
-    res.setHeader("Content-Disposition", "inline");
-    res.sendFile(path.join(ATTACHMENTS_DIR, attachment.stored_name));
+    await streamAttachment(res, attachment, "inline");
   } catch (err) {
     next(err);
   }
@@ -1678,7 +1675,7 @@ router.get("/tickets/:id/attachments/:attachmentId/download", async (req, res, n
       return res.status(404).render("error", { title: "Not found", message: "That attachment does not exist." });
     }
 
-    res.download(path.join(ATTACHMENTS_DIR, attachment.stored_name), attachment.original_name);
+    await streamAttachment(res, attachment, "attachment");
   } catch (err) {
     next(err);
   }

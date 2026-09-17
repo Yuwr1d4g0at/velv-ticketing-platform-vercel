@@ -7,10 +7,8 @@
 // NOT safely atomic against a connection pool (see db/index.js's transaction()
 // doc comment for why) - rewritten to use the new transaction() helper, which
 // checks out one client for the whole callback.
-const fs = require("fs");
-const path = require("path");
 const db = require("./db");
-const { ATTACHMENTS_DIR } = require("./attachments");
+const { deleteAttachmentBlob } = require("./attachments");
 
 // Everything on file for one requester: their tickets, the full activity
 // feed on each, attachment metadata (not the file bytes - an agent doing
@@ -71,14 +69,14 @@ async function eraseRequesterData(email) {
   const ticketIds = tickets.map((t) => t.id);
   const placeholders = ticketIds.map(() => "?").join(",");
 
-  // Delete attachment files from disk before touching the DB rows - if this
-  // is interrupted partway, a leftover file with no DB row is a much safer
+  // Delete attachment blobs before touching the DB rows - if this is
+  // interrupted partway, a leftover blob with no DB row is a much safer
   // failure mode than a DB row pointing at a file that's already gone.
   const attachments = await db
     .prepare(`SELECT stored_name FROM attachments WHERE ticket_id IN (${placeholders})`)
     .all(...ticketIds);
   for (const a of attachments) {
-    fs.unlink(path.join(ATTACHMENTS_DIR, a.stored_name), () => {});
+    await deleteAttachmentBlob(a.stored_name);
   }
 
   await db.transaction(async (tx) => {

@@ -1,5 +1,4 @@
 const express = require("express");
-const path = require("path");
 const rateLimit = require("express-rate-limit");
 const db = require("../db");
 const departments = require("../departments");
@@ -12,13 +11,13 @@ const customFields = require("../custom-fields");
 const automation = require("../automation");
 const notifications = require("../notifications");
 const {
-  ATTACHMENTS_DIR,
   SAFE_PREVIEW_TYPES,
   handleUpload,
   saveAttachments,
   deleteUploadedFiles,
   attachmentsForTicket,
   getPublicAttachment,
+  streamAttachment,
   formatSize,
   LIMITS_HINT,
 } = require("../attachments");
@@ -577,7 +576,7 @@ router.post("/status/attachments/:attachmentId/download", statusLimiter, require
       return res.status(404).render("error", { title: "Not found", message: "That attachment does not exist." });
     }
 
-    res.download(path.join(ATTACHMENTS_DIR, attachment.stored_name), attachment.original_name);
+    await streamAttachment(res, attachment, "attachment");
   } catch (err) {
     next(err);
   }
@@ -602,9 +601,7 @@ router.get("/status/attachments/:attachmentId/preview", previewLimiter, requireR
       return res.status(404).render("error", { title: "Not found", message: "No preview is available for that attachment." });
     }
 
-    res.setHeader("Content-Type", attachment.mime_type);
-    res.setHeader("Content-Disposition", "inline");
-    res.sendFile(path.join(ATTACHMENTS_DIR, attachment.stored_name));
+    await streamAttachment(res, attachment, "inline");
   } catch (err) {
     next(err);
   }
