@@ -19,7 +19,11 @@
         <img class="brand-logo brand-logo-dark" src="/img/velv-logo-white.png" alt="Velv">
         <span class="brand-suffix">Ticketing</span>
       </a>
-      <div class="nav-cluster">
+      <button type="button" class="nav-toggle" id="nav-toggle" aria-expanded="false" aria-controls="nav-cluster" aria-label="Menu">
+        <span class="icon icon-menu nav-toggle-icon-open"></span>
+        <span class="icon icon-x nav-toggle-icon-close"></span>
+      </button>
+      <div class="nav-cluster" id="nav-cluster">
         <nav class="main-nav">
           <% if (typeof currentAgent !== 'undefined' && currentAgent) { %>
             <a href="/dashboard">Dashboard</a>
@@ -61,7 +65,6 @@
           <% } else { %>
             <a href="/"><%= t('nav_submit_request') %></a>
             <a href="/status"><%= t('nav_check_status') %></a>
-            <a href="/kb">Help center</a>
             <a href="/login" class="nav-cta"><%= t('nav_helpdesk_login') %></a>
           <% } %>
         </nav>

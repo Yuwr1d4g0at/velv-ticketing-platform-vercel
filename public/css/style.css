@@ -224,6 +224,8 @@ hr { border: none; border-top: 1px solid var(--border-subtle); margin: var(--spa
 .icon-moon { -webkit-mask-image: url("/icons/moon.svg"); mask-image: url("/icons/moon.svg"); }
 .icon-download { -webkit-mask-image: url("/icons/download.svg"); mask-image: url("/icons/download.svg"); }
 .icon-bell { -webkit-mask-image: url("/icons/bell.svg"); mask-image: url("/icons/bell.svg"); }
+.icon-menu { -webkit-mask-image: url("/icons/menu.svg"); mask-image: url("/icons/menu.svg"); }
+.icon-x { -webkit-mask-image: url("/icons/x.svg"); mask-image: url("/icons/x.svg"); }
 .icon-star { -webkit-mask-image: url("/icons/star.svg"); mask-image: url("/icons/star.svg"); }
 .icon-inbox { -webkit-mask-image: url("/icons/inbox.svg"); mask-image: url("/icons/inbox.svg"); }
 
@@ -283,6 +285,26 @@ hr { border: none; border-top: 1px solid var(--border-subtle); margin: var(--spa
 }
 
 .nav-cluster { display: flex; align-items: center; gap: var(--space-5); flex-wrap: wrap; }
+
+/* ---- Mobile nav toggle (hamburger) - hidden entirely above the mobile
+   breakpoint below, where .nav-cluster just displays inline as normal. ---- */
+.nav-toggle {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--surface-card);
+  color: var(--text-strong);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.nav-toggle:hover { background: var(--bg-subtle); }
+.nav-toggle-icon-close { display: none; }
+.nav-toggle[aria-expanded="true"] .nav-toggle-icon-open { display: none; }
+.nav-toggle[aria-expanded="true"] .nav-toggle-icon-close { display: inline-block; }
 
 .main-nav { display: flex; align-items: center; gap: var(--space-1); flex-wrap: wrap; }
 .main-nav a {
@@ -429,11 +451,41 @@ hr { border: none; border-top: 1px solid var(--border-subtle); margin: var(--spa
 .lights-toggle input:focus-visible ~ .lights-track { outline: 3px solid var(--focus-ring); outline-offset: 2px; }
 
 @media (max-width: 640px) {
-  .site-header-inner { padding: var(--space-2) var(--space-4); gap: var(--space-2); }
+  .site-header-inner { padding: var(--space-2) var(--space-4); gap: var(--space-2); position: relative; }
   .brand-suffix { display: none; }
   .lights-label { display: none; }
   .main-nav .nav-user { display: none; }
-  .nav-cluster { gap: var(--space-3); }
+
+  /* The hamburger button only exists at this width - above it .nav-cluster
+     just displays inline as normal (see the un-media-queried rules above). */
+  .nav-toggle { display: inline-flex; }
+
+  /* Collapsed into a full-width dropdown panel under the header, open only
+     while #nav-toggle has added .is-open (see public/js/nav-toggle.js). */
+  .nav-cluster {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-3);
+    max-height: calc(100vh - var(--header-h));
+    overflow-y: auto;
+    background: var(--surface-card);
+    border-bottom: 1px solid var(--border-subtle);
+    box-shadow: var(--shadow-md);
+    padding: var(--space-3) var(--space-4) var(--space-4);
+    z-index: 20;
+  }
+  .nav-cluster.is-open { display: flex; }
+
+  .main-nav { flex-direction: column; align-items: stretch; gap: var(--space-1); }
+  .main-nav a, .main-nav .nav-cta { width: 100%; text-align: left; }
+  .main-nav .nav-user { display: flex; width: 100%; }
+  .notif-bell { align-self: flex-start; }
+  .notif-dropdown { width: min(320px, calc(100vw - 2 * var(--space-5))); right: auto; left: 0; }
 }
 
 /* ============================================================
