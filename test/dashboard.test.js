@@ -1,6 +1,5 @@
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -10,13 +9,9 @@ before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
 
-  const db = new DatabaseSync(app.dbPath);
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Dash Agent",
-    "dash-agent@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
-  db.close();
+  await app.db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Dash Agent", "dash-agent@example.com", bcrypt.hashSync("correct-password", 4));
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
@@ -63,9 +58,9 @@ test("priority is rejected if it isn't one of the known values", async () => {
 test("a ticket older than the aging threshold is flagged on the dashboard", async () => {
   const ticketId = await createTicket("Old forgotten ticket");
 
-  const db = new DatabaseSync(app.dbPath);
-  db.prepare("UPDATE tickets SET created_at = datetime('now', '-10 days') WHERE id = ?").run(Number(ticketId));
-  db.close();
+  await app.db
+    .prepare("UPDATE tickets SET created_at = to_char((now() AT TIME ZONE 'UTC') - INTERVAL '10 days', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?")
+    .run(Number(ticketId));
 
   const res = await client.get("/dashboard");
   const html = await res.text();
@@ -91,15 +86,13 @@ test("dashboard pagination shows page 2 once there are enough tickets", async ()
   // "submitting is rate-limited" test in public.test.js), and 30 requests
   // from the same fixture would trip it, which isn't what this test is
   // about.
-  const db = new DatabaseSync(app.dbPath);
-  const insert = db.prepare(
+  const insert = app.db.prepare(
     `INSERT INTO tickets (subject, description, category, requester_name, requester_email)
      VALUES (?, 'd', 'Network', 'Filter Test', 'filter-test@example.com')`
   );
   for (let i = 0; i < 30; i++) {
-    insert.run(`Pagination filler ${i}`);
+    await insert.run(`Pagination filler ${i}`);
   }
-  db.close();
 
   const page1 = await client.get("/dashboard?q=Pagination%20filler");
   const page1Html = await page1.text();

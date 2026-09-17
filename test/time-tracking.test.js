@@ -9,14 +9,9 @@ before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
 
-  const { DatabaseSync } = require("node:sqlite");
-  const db = new DatabaseSync(app.dbPath);
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Time Agent",
-    "time-agent@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
-  db.close();
+  await app.db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Time Agent", "time-agent@example.com", bcrypt.hashSync("correct-password", 4));
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());

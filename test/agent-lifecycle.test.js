@@ -1,6 +1,5 @@
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -10,20 +9,15 @@ before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
 
-  const db = new DatabaseSync(app.dbPath);
+  const db = app.db;
   // is_admin: this suite exercises agent management (deactivate/reactivate),
   // which is admin-only.
-  db.prepare("INSERT INTO agents (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)").run(
-    "Main Agent",
-    "main-agent@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
-  db.prepare("INSERT INTO agents (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)").run(
-    "Second Agent",
-    "second-agent@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
-  db.close();
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)")
+    .run("Main Agent", "main-agent@example.com", bcrypt.hashSync("correct-password", 4));
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)")
+    .run("Second Agent", "second-agent@example.com", bcrypt.hashSync("correct-password", 4));
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
@@ -32,17 +26,15 @@ before(async () => {
 
 after(() => app.close());
 
-function agentId(email) {
-  const db = new DatabaseSync(app.dbPath);
-  const row = db.prepare("SELECT id FROM agents WHERE email = ?").get(email);
-  db.close();
+async function agentId(email) {
+  const row = await app.db.prepare("SELECT id FROM agents WHERE email = ?").get(email);
   return row.id;
 }
 
 test("an agent can't deactivate their own account", async () => {
   const page = await client.get("/dashboard/agents");
   const csrf = extractCsrf(await page.text());
-  const selfId = agentId("main-agent@example.com");
+  const selfId = await agentId("main-agent@example.com");
 
   const res = await client.postForm(`/dashboard/agents/${selfId}/deactivate`, { _csrf: csrf });
   assert.equal(res.status, 400);
@@ -67,7 +59,7 @@ test("deactivating an agent blocks login and ends any existing session", async (
 
   const dashPage = await client.get("/dashboard/agents");
   const csrf = extractCsrf(await dashPage.text());
-  const secondId = agentId("second-agent@example.com");
+  const secondId = await agentId("second-agent@example.com");
   const deactivateRes = await client.postForm(`/dashboard/agents/${secondId}/deactivate`, { _csrf: csrf });
   assert.equal(deactivateRes.status, 302);
 
@@ -92,7 +84,7 @@ test("deactivating an agent blocks login and ends any existing session", async (
 });
 
 test("can't deactivate the last active agent", async () => {
-  const secondId = agentId("second-agent@example.com");
+  const secondId = await agentId("second-agent@example.com");
   const secondClient = makeClient(app.baseUrl);
   const loginPage = await secondClient.get("/login");
   const loginCsrf = extractCsrf(await loginPage.text());
@@ -105,7 +97,7 @@ test("can't deactivate the last active agent", async () => {
   // Second agent deactivates the main agent - fine, two active agents left.
   const page1 = await secondClient.get("/dashboard/agents");
   const csrf1 = extractCsrf(await page1.text());
-  const mainId = agentId("main-agent@example.com");
+  const mainId = await agentId("main-agent@example.com");
   const res1 = await secondClient.postForm(`/dashboard/agents/${mainId}/deactivate`, { _csrf: csrf1 });
   assert.equal(res1.status, 302);
 
@@ -115,10 +107,8 @@ test("can't deactivate the last active agent", async () => {
   // they're the last one signed in. Directly assert the guard via a fresh
   // privileged action: reactivate main agent, then confirm the count guard
   // independently by checking both are active again.
-  const dbCheck = new DatabaseSync(app.dbPath);
-  const activeCount = dbCheck.prepare("SELECT COUNT(*) AS c FROM agents WHERE active = 1").get().c;
-  dbCheck.close();
-  assert.equal(activeCount, 1);
+  const activeCountRow = await app.db.prepare("SELECT COUNT(*) AS c FROM agents WHERE active = 1").get();
+  assert.equal(activeCountRow.c, 1);
 
   // Reactivate main agent so later tests in the suite aren't affected.
   const page2 = await secondClient.get("/dashboard/agents");

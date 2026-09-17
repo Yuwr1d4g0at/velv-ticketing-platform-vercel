@@ -1,6 +1,5 @@
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -10,13 +9,9 @@ before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
 
-  const db = new DatabaseSync(app.dbPath);
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Feature Agent",
-    "feature-agent@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
-  db.close();
+  await app.db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Feature Agent", "feature-agent@example.com", bcrypt.hashSync("correct-password", 4));
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
@@ -50,16 +45,14 @@ test("tags: adding, filtering, and removing a tag", async () => {
 
   // Case-insensitive reuse: "billing" should not create a second tag row.
   await client.postForm(`/dashboard/tickets/${ticketId}/tags`, { tag: "billing", _csrf: csrf });
-  const db = new DatabaseSync(app.dbPath);
-  const tagCount = db.prepare("SELECT COUNT(*) AS c FROM tags WHERE name = 'Billing' COLLATE NOCASE").get().c;
-  assert.equal(tagCount, 1);
+  const tagCountRow = await app.db.prepare("SELECT COUNT(*) AS c FROM tags WHERE LOWER(name) = LOWER('Billing')").get();
+  assert.equal(tagCountRow.c, 1);
 
   const filtered = await client.get("/dashboard?tag=billing");
   const filteredHtml = await filtered.text();
   assert.match(filteredHtml, /Tag test ticket/);
 
-  const tagRow = db.prepare("SELECT id FROM tags WHERE name = 'Billing' COLLATE NOCASE").get();
-  db.close();
+  const tagRow = await app.db.prepare("SELECT id FROM tags WHERE LOWER(name) = LOWER('Billing')").get();
 
   const removeRes = await client.postForm(`/dashboard/tickets/${ticketId}/tags/${tagRow.id}/remove`, { _csrf: csrf });
   assert.equal(removeRes.status, 302);
@@ -86,9 +79,7 @@ test("canned responses: create, list, and delete", async () => {
   const html = await afterCreate.text();
   assert.match(html, /Zzz canned response fixture/);
 
-  const db = new DatabaseSync(app.dbPath);
-  const row = db.prepare("SELECT id FROM canned_responses WHERE title = 'Zzz canned response fixture'").get();
-  db.close();
+  const row = await app.db.prepare("SELECT id FROM canned_responses WHERE title = 'Zzz canned response fixture'").get();
 
   const deleteRes = await client.postForm(`/dashboard/canned-responses/${row.id}/delete`, { _csrf: csrf });
   assert.equal(deleteRes.status, 302);
@@ -103,9 +94,7 @@ test("CSAT: resolving a ticket enables its rating link, which accepts one rating
 
   await client.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Resolved", _csrf: csrf });
 
-  const db = new DatabaseSync(app.dbPath);
-  const { rating_token: token } = db.prepare("SELECT rating_token FROM tickets WHERE id = ?").get(Number(ticketId));
-  db.close();
+  const { rating_token: token } = await app.db.prepare("SELECT rating_token FROM tickets WHERE id = ?").get(Number(ticketId));
   assert.ok(token, "expected a rating_token to be generated on resolve");
 
   const ratePage = await client.get(`/rate/${token}`);

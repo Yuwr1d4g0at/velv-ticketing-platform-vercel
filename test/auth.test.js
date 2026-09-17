@@ -1,6 +1,5 @@
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -11,13 +10,9 @@ before(async () => {
   client = makeClient(app.baseUrl);
 
   // Seed an agent directly - same shape as src/db/seed.js, without the CLI prompt.
-  const db = new DatabaseSync(app.dbPath);
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Test Agent",
-    "agent@example.com",
-    bcrypt.hashSync("correct-password", 4) // low cost factor - speed, not security, in tests
-  );
-  db.close();
+  await app.db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Test Agent", "agent@example.com", bcrypt.hashSync("correct-password", 4)); // low cost factor - speed, not security, in tests
 });
 
 after(() => app.close());

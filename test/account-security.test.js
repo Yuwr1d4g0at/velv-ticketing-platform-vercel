@@ -6,7 +6,6 @@
 //      reset.
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 const totp = require("../src/totp");
@@ -20,7 +19,7 @@ async function loginAs(c, email, password = "correct-password") {
 }
 
 function db() {
-  return new DatabaseSync(app.dbPath);
+  return app.db;
 }
 
 before(async () => {
@@ -28,17 +27,12 @@ before(async () => {
 
   const d = db();
   const passwordHash = bcrypt.hashSync("correct-password", 4);
-  d.prepare("INSERT INTO agents (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)").run(
-    "Admin Agent",
-    "admin@example.com",
-    passwordHash
-  );
-  d.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Regular Agent",
-    "regular@example.com",
-    passwordHash
-  );
-  d.close();
+  await d
+    .prepare("INSERT INTO agents (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)")
+    .run("Admin Agent", "admin@example.com", passwordHash);
+  await d
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Regular Agent", "regular@example.com", passwordHash);
 
   adminClient = makeClient(app.baseUrl);
   agentClient = makeClient(app.baseUrl);
@@ -48,22 +42,20 @@ before(async () => {
 
 after(() => app.close());
 
-function createTicketDirect({ subject = "A ticket", category = "Hardware" } = {}) {
-  const d = db();
-  const result = d
+async function createTicketDirect({ subject = "A ticket", category = "Hardware" } = {}) {
+  const result = await db()
     .prepare(
       `INSERT INTO tickets (subject, description, category, requester_name, requester_email)
        VALUES (?, 'desc', ?, 'Rita Requester', 'rita@example.com')`
     )
     .run(subject, category);
-  d.close();
   return result.lastInsertRowid;
 }
 
 // ---- View as requester ----------------------------------------------------
 
 test("a non-admin agent can't use view-as-requester", async () => {
-  const ticketId = createTicketDirect({ subject: "Non-admin blocked" });
+  const ticketId = await createTicketDirect({ subject: "Non-admin blocked" });
   const res = await agentClient.get(`/dashboard/tickets/${ticketId}/view-as-requester`);
   assert.equal(res.status, 403);
   const html = await res.text();
@@ -71,7 +63,7 @@ test("a non-admin agent can't use view-as-requester", async () => {
 });
 
 test("an admin sees the exact public status page for the ticket, bannered as preview-only and with no way to act as the requester", async () => {
-  const ticketId = createTicketDirect({ subject: "Preview me", category: "Software" });
+  const ticketId = await createTicketDirect({ subject: "Preview me", category: "Software" });
 
   const res = await adminClient.get(`/dashboard/tickets/${ticketId}/view-as-requester`);
   assert.equal(res.status, 200);
@@ -93,15 +85,13 @@ test("an admin sees the exact public status page for the ticket, bannered as pre
 });
 
 test("every view-as-requester use is logged as auditable ticket activity", async () => {
-  const ticketId = createTicketDirect({ subject: "Audited preview" });
+  const ticketId = await createTicketDirect({ subject: "Audited preview" });
 
   await adminClient.get(`/dashboard/tickets/${ticketId}/view-as-requester`);
 
-  const d = db();
-  const row = d
+  const row = await db()
     .prepare("SELECT body FROM ticket_activity WHERE ticket_id = ? AND type = 'note' ORDER BY id DESC LIMIT 1")
     .get(ticketId);
-  d.close();
 
   assert.ok(row, "expected a ticket_activity row logging the preview");
   assert.match(row.body, /Admin Agent previewed this ticket as the requester/);
@@ -179,9 +169,7 @@ test("2FA setup shows a secret only after starting setup, requires a real code b
 
   // A DB row isn't enabled yet - the secret only exists in the session
   // until it's actually verified.
-  const d = db();
-  const row = d.prepare("SELECT totp_enabled, totp_secret FROM agents WHERE email = ?").get("regular@example.com");
-  d.close();
+  const row = await db().prepare("SELECT totp_enabled, totp_secret FROM agents WHERE email = ?").get("regular@example.com");
   assert.equal(row.totp_enabled, 0);
   assert.equal(row.totp_secret, null);
 
@@ -204,21 +192,17 @@ test("2FA setup shows a secret only after starting setup, requires a real code b
   const okHtml = await okRes.text();
   assert.match(okHtml, /now on/);
 
-  const d2 = db();
-  const row2 = d2.prepare("SELECT totp_enabled, totp_secret FROM agents WHERE email = ?").get("regular@example.com");
-  d2.close();
+  const row2 = await db().prepare("SELECT totp_enabled, totp_secret FROM agents WHERE email = ?").get("regular@example.com");
   assert.equal(row2.totp_enabled, 1);
   assert.equal(row2.totp_secret, secret);
 });
 
 test("once 2FA is enabled, login requires the password AND a valid code, and a wrong code is logged as a failed attempt without logging in", async () => {
-  const d = db();
   const passwordHash = bcrypt.hashSync("correct-password", 4);
   const secret = totp.generateSecret();
-  d.prepare(
-    "INSERT INTO agents (name, email, password_hash, totp_secret, totp_enabled) VALUES (?, ?, ?, ?, 1)"
-  ).run("2FA Agent", "twofactor@example.com", passwordHash, secret);
-  d.close();
+  await db()
+    .prepare("INSERT INTO agents (name, email, password_hash, totp_secret, totp_enabled) VALUES (?, ?, ?, ?, 1)")
+    .run("2FA Agent", "twofactor@example.com", passwordHash, secret);
 
   const client = makeClient(app.baseUrl);
   const passwordRes = await loginAs(client, "twofactor@example.com");
@@ -239,12 +223,10 @@ test("once 2FA is enabled, login requires the password AND a valid code, and a w
   assert.equal(stillLoggedOut2.status, 302);
   assert.equal(stillLoggedOut2.headers.get("location"), "/login");
 
-  const d2 = db();
-  const failedLog = d2
+  const failedLog = await db()
     .prepare("SELECT success FROM login_log WHERE email = ? ORDER BY id DESC LIMIT 1")
     .get("twofactor@example.com");
-  d2.close();
-  assert.equal(failedLog.success, 0, "a wrong 2FA code should show up as a failed login attempt, not a success");
+  assert.equal(Number(failedLog.success), 0, "a wrong 2FA code should show up as a failed login attempt, not a success");
 
   const codePage2 = await (await client.get("/login/2fa")).text();
   const csrf2 = extractCsrf(codePage2);
@@ -257,12 +239,10 @@ test("once 2FA is enabled, login requires the password AND a valid code, and a w
   assert.equal((await client.get("/dashboard")).status, 200);
   assert.match(dashboard, /Signed in as 2FA Agent/);
 
-  const d3 = db();
-  const successLog = d3
+  const successLog = await db()
     .prepare("SELECT success, agent_id FROM login_log WHERE email = ? ORDER BY id DESC LIMIT 1")
     .get("twofactor@example.com");
-  d3.close();
-  assert.equal(successLog.success, 1);
+  assert.equal(Number(successLog.success), 1);
 });
 
 test("logging in without 2FA enabled is unaffected - straight to the dashboard, same as before this feature existed", async () => {
@@ -275,13 +255,11 @@ test("logging in without 2FA enabled is unaffected - straight to the dashboard, 
 });
 
 test("disabling 2FA requires the correct current password", async () => {
-  const d = db();
   const passwordHash = bcrypt.hashSync("correct-password", 4);
   const secret = totp.generateSecret();
-  d.prepare(
-    "INSERT INTO agents (name, email, password_hash, totp_secret, totp_enabled) VALUES (?, ?, ?, ?, 1)"
-  ).run("Disable Me", "disableme@example.com", passwordHash, secret);
-  d.close();
+  await db()
+    .prepare("INSERT INTO agents (name, email, password_hash, totp_secret, totp_enabled) VALUES (?, ?, ?, ?, 1)")
+    .run("Disable Me", "disableme@example.com", passwordHash, secret);
 
   const client = makeClient(app.baseUrl);
   await loginAs(client, "disableme@example.com");
@@ -299,9 +277,7 @@ test("disabling 2FA requires the correct current password", async () => {
   assert.equal(wrongPasswordRes.status, 400);
   assert.match(await wrongPasswordRes.text(), /Incorrect password/);
 
-  const d2 = db();
-  const stillOn = d2.prepare("SELECT totp_enabled FROM agents WHERE email = ?").get("disableme@example.com");
-  d2.close();
+  const stillOn = await db().prepare("SELECT totp_enabled FROM agents WHERE email = ?").get("disableme@example.com");
   assert.equal(stillOn.totp_enabled, 1);
 
   const rightPasswordRes = await client.postForm("/dashboard/settings/security/2fa/disable", {
@@ -311,9 +287,7 @@ test("disabling 2FA requires the correct current password", async () => {
   assert.equal(rightPasswordRes.status, 200);
   assert.match(await rightPasswordRes.text(), /turned off/);
 
-  const d3 = db();
-  const nowOff = d3.prepare("SELECT totp_enabled, totp_secret FROM agents WHERE email = ?").get("disableme@example.com");
-  d3.close();
+  const nowOff = await db().prepare("SELECT totp_enabled, totp_secret FROM agents WHERE email = ?").get("disableme@example.com");
   assert.equal(nowOff.totp_enabled, 0);
   assert.equal(nowOff.totp_secret, null);
 
@@ -324,16 +298,12 @@ test("disabling 2FA requires the correct current password", async () => {
 });
 
 test("an admin can reset another agent's 2FA (lost device), and it's logged as an auditable admin action", async () => {
-  const d = db();
   const passwordHash = bcrypt.hashSync("correct-password", 4);
   const secret = totp.generateSecret();
-  const insertResult = d
-    .prepare(
-      "INSERT INTO agents (name, email, password_hash, totp_secret, totp_enabled) VALUES (?, ?, ?, ?, 1)"
-    )
+  const insertResult = await db()
+    .prepare("INSERT INTO agents (name, email, password_hash, totp_secret, totp_enabled) VALUES (?, ?, ?, ?, 1)")
     .run("Lost Device", "lostdevice@example.com", passwordHash, secret);
   const targetId = insertResult.lastInsertRowid;
-  d.close();
 
   const agentsPage = await (await adminClient.get("/dashboard/agents")).text();
   const csrf = extractCsrf(agentsPage);
@@ -341,17 +311,13 @@ test("an admin can reset another agent's 2FA (lost device), and it's logged as a
   const resetRes = await adminClient.postForm(`/dashboard/agents/${targetId}/reset-2fa`, { _csrf: csrf });
   assert.equal(resetRes.status, 302);
 
-  const d2 = db();
-  const row = d2.prepare("SELECT totp_enabled, totp_secret FROM agents WHERE id = ?").get(targetId);
-  d2.close();
+  const row = await db().prepare("SELECT totp_enabled, totp_secret FROM agents WHERE id = ?").get(targetId);
   assert.equal(row.totp_enabled, 0);
   assert.equal(row.totp_secret, null);
 
-  const d3 = db();
-  const activityRow = d3
+  const activityRow = await db()
     .prepare("SELECT body FROM agent_activity WHERE target_agent_id = ? ORDER BY id DESC LIMIT 1")
     .get(targetId);
-  d3.close();
   assert.ok(activityRow, "expected an agent_activity row for the reset");
   assert.match(activityRow.body, /reset two-factor authentication for Lost Device/);
 
@@ -365,13 +331,11 @@ test("an admin can reset another agent's 2FA (lost device), and it's logged as a
 });
 
 test("a non-admin agent can't reset another agent's 2FA", async () => {
-  const d = db();
   const passwordHash = bcrypt.hashSync("correct-password", 4);
-  const insertResult = d
+  const insertResult = await db()
     .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
     .run("Someone Else", "someoneelse@example.com", passwordHash);
   const targetId = insertResult.lastInsertRowid;
-  d.close();
 
   const page = await (await agentClient.get("/dashboard")).text();
   const csrf = extractCsrf(page);

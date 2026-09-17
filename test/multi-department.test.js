@@ -9,7 +9,6 @@
 // gap the old test suite missed.
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -33,54 +32,38 @@ before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
 
-  const db = new DatabaseSync(app.dbPath);
+  const db = app.db;
   const passwordHash = bcrypt.hashSync("correct-password", 4);
 
   // IT is department id 1, HR is id 2 - seeded in that fixed order by
   // src/db/index.js on a fresh database (see DEFAULT_DEPARTMENTS there).
-  db.prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, ?)").run(
-    "IT Agent",
-    "it-agent@example.com",
-    passwordHash,
-    1
-  );
-  db.prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, ?)").run(
-    "HR Agent",
-    "hr-agent@example.com",
-    passwordHash,
-    2
-  );
-  db.prepare("INSERT INTO agents (name, email, password_hash, department_id, is_admin) VALUES (?, ?, ?, ?, 1)").run(
-    "Admin Agent",
-    "admin-agent@example.com",
-    passwordHash,
-    1
-  );
-  db.prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, 1)").run(
-    "Second IT Agent",
-    "second-it-agent@example.com",
-    passwordHash
-  );
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, ?)")
+    .run("IT Agent", "it-agent@example.com", passwordHash, 1);
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, ?)")
+    .run("HR Agent", "hr-agent@example.com", passwordHash, 2);
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, department_id, is_admin) VALUES (?, ?, ?, ?, 1)")
+    .run("Admin Agent", "admin-agent@example.com", passwordHash, 1);
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, 1)")
+    .run("Second IT Agent", "second-it-agent@example.com", passwordHash);
   // A dedicated agent for the one test that actually mutates its own
   // department mid-test (the exact "switch department, does the visible
   // list change" regression) - kept separate from it-agent/hr-agent so that
   // mutation can't bleed into every other test in this file.
-  db.prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, 1)").run(
-    "Switcher Agent",
-    "switcher-agent@example.com",
-    passwordHash
-  );
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, 1)")
+    .run("Switcher Agent", "switcher-agent@example.com", passwordHash);
   // A Legal-department agent (department id 3 - Legal is seeded third, see
   // DEFAULT_DEPARTMENTS in src/db/index.js) - used by the department
   // transfer and department-capacity tests below, both of which want a
   // department untouched by every other test in this file so its
   // tickets/agents start from a known, deterministic zero.
-  db.prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, 3)").run(
-    "Legal Agent",
-    "legal-agent@example.com",
-    passwordHash
-  );
-  db.close();
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, 3)")
+    .run("Legal Agent", "legal-agent@example.com", passwordHash);
 
   itClient = makeClient(app.baseUrl);
   hrClient = makeClient(app.baseUrl);
@@ -99,34 +82,30 @@ before(async () => {
 after(() => app.close());
 
 function db() {
-  return new DatabaseSync(app.dbPath);
+  return app.db;
 }
 
-function agentId(email) {
-  const d = db();
-  const row = d.prepare("SELECT id FROM agents WHERE email = ?").get(email);
-  d.close();
+async function agentId(email) {
+  const row = await db().prepare("SELECT id FROM agents WHERE email = ?").get(email);
   return row.id;
 }
 
 // Inserts a ticket directly (bypassing auto-assignment/round-robin, which
 // has its own dedicated test below) so each visibility test can set up
 // exactly the category/assignment/confidential combination it needs.
-function createTicketDirect({ subject, category, assignedTo = null, confidential = 0 }) {
-  const d = db();
-  const result = d
+async function createTicketDirect({ subject, category, assignedTo = null, confidential = 0 }) {
+  const result = await db()
     .prepare(
       `INSERT INTO tickets (subject, description, category, requester_name, requester_email, assigned_to, confidential)
        VALUES (?, 'desc', ?, 'Req', 'req@example.com', ?, ?)`
     )
     .run(subject, category, assignedTo, confidential);
-  d.close();
   return result.lastInsertRowid;
 }
 
 test("a non-admin agent only sees tickets in their own department's categories on the dashboard list", async () => {
-  const itTicketId = createTicketDirect({ subject: "IT-only ticket", category: "Hardware" });
-  const hrTicketId = createTicketDirect({ subject: "HR-only ticket", category: "Onboarding" });
+  const itTicketId = await createTicketDirect({ subject: "IT-only ticket", category: "Hardware" });
+  const hrTicketId = await createTicketDirect({ subject: "HR-only ticket", category: "Onboarding" });
 
   const itHome = await (await itClient.get("/dashboard")).text();
   assert.match(itHome, new RegExp(`tickets/${itTicketId}"`));
@@ -138,18 +117,18 @@ test("a non-admin agent only sees tickets in their own department's categories o
 });
 
 test("visiting another department's ticket by id 404s, even though it exists", async () => {
-  const hrTicketId = createTicketDirect({ subject: "HR ticket for 404 check", category: "Benefits" });
+  const hrTicketId = await createTicketDirect({ subject: "HR ticket for 404 check", category: "Benefits" });
 
   const res = await itClient.get(`/dashboard/tickets/${hrTicketId}`);
   assert.equal(res.status, 404);
 });
 
 test("assignment does NOT grant visibility across departments - the exact carve-out that broke this feature last time", async () => {
-  const itAgentId = agentId("it-agent@example.com");
+  const itAgentId = await agentId("it-agent@example.com");
   // An HR-category ticket assigned to the IT agent - this is the precise
   // shape of bug that shipped and was reverted before: a ticket assigned to
   // the one agent being tested made a department switch look like a no-op.
-  const hrTicketAssignedToItAgent = createTicketDirect({
+  const hrTicketAssignedToItAgent = await createTicketDirect({
     subject: "HR ticket incorrectly assigned to an IT agent",
     category: "Benefits",
     assignedTo: itAgentId,
@@ -167,7 +146,7 @@ test("watching a ticket does not grant visibility across departments either", as
   // gates it), so this proves the point indirectly: confirm the watch route
   // itself 404s for an out-of-department ticket rather than silently
   // succeeding and creating a visibility loophole.
-  const hrTicketId = createTicketDirect({ subject: "HR ticket for watch check", category: "Employee Relations" });
+  const hrTicketId = await createTicketDirect({ subject: "HR ticket for watch check", category: "Employee Relations" });
   const page = await itClient.get("/dashboard");
   const csrf = extractCsrf(await page.text());
 
@@ -180,8 +159,8 @@ test("REGRESSION: changing an agent's department changes what they see, without 
   // itClient/it-agent - this test permanently mutates its agent's
   // department, and every other test in this file needs it-agent to stay
   // in IT for its own assumptions to hold.
-  const itTicketId = createTicketDirect({ subject: "Stays IT", category: "Network" });
-  const hrTicketId = createTicketDirect({ subject: "Stays HR", category: "Onboarding" });
+  const itTicketId = await createTicketDirect({ subject: "Stays IT", category: "Network" });
+  const hrTicketId = await createTicketDirect({ subject: "Stays HR", category: "Onboarding" });
 
   const before1 = await (await switcherClient.get("/dashboard")).text();
   assert.match(before1, new RegExp(`tickets/${itTicketId}"`), "switcher agent should see the IT ticket before switching");
@@ -189,9 +168,9 @@ test("REGRESSION: changing an agent's department changes what they see, without 
 
   // Switch the same agent to HR - the exact scenario that silently failed
   // to work last time (department field changed, visible list didn't).
-  const d = db();
-  d.prepare("UPDATE agents SET department_id = 2 WHERE email = ?").run("switcher-agent@example.com");
-  d.close();
+  
+  await db().prepare("UPDATE agents SET department_id = 2 WHERE email = ?").run("switcher-agent@example.com");
+
 
   const afterHome = await (await switcherClient.get("/dashboard")).text();
   assert.match(afterHome, new RegExp(`tickets/${hrTicketId}"`), "after switching to HR, the agent must now see the HR ticket");
@@ -199,8 +178,8 @@ test("REGRESSION: changing an agent's department changes what they see, without 
 });
 
 test("an admin sees tickets from every department", async () => {
-  const itTicketId = createTicketDirect({ subject: "IT ticket for admin check", category: "Software" });
-  const hrTicketId = createTicketDirect({ subject: "HR ticket for admin check", category: "Onboarding" });
+  const itTicketId = await createTicketDirect({ subject: "IT ticket for admin check", category: "Software" });
+  const hrTicketId = await createTicketDirect({ subject: "HR ticket for admin check", category: "Onboarding" });
 
   const home = await (await adminClient.get("/dashboard")).text();
   assert.match(home, new RegExp(`tickets/${itTicketId}"`));
@@ -213,9 +192,9 @@ test("an admin sees tickets from every department", async () => {
 });
 
 test("a confidential ticket is hidden from a same-department agent who isn't its assignee, but visible to the assignee and an admin", async () => {
-  const itAgentId = agentId("it-agent@example.com");
+  const itAgentId = await agentId("it-agent@example.com");
 
-  const confidentialTicketId = createTicketDirect({
+  const confidentialTicketId = await createTicketDirect({
     subject: "Confidential IT ticket",
     category: "Hardware",
     assignedTo: itAgentId,
@@ -233,28 +212,24 @@ test("a confidential ticket is hidden from a same-department agent who isn't its
 });
 
 test("toggling the confidential flag on and off works from the ticket page", async () => {
-  const itAgentId = agentId("it-agent@example.com");
-  const ticketId = createTicketDirect({ subject: "Toggle confidential", category: "Hardware", assignedTo: itAgentId });
+  const itAgentId = await agentId("it-agent@example.com");
+  const ticketId = await createTicketDirect({ subject: "Toggle confidential", category: "Hardware", assignedTo: itAgentId });
 
   const page = await itClient.get(`/dashboard/tickets/${ticketId}`);
   const csrf = extractCsrf(await page.text());
 
   const onRes = await itClient.postForm(`/dashboard/tickets/${ticketId}/confidential`, { confidential: "1", _csrf: csrf });
   assert.equal(onRes.status, 302);
-  const d = db();
-  assert.equal(d.prepare("SELECT confidential FROM tickets WHERE id = ?").get(ticketId).confidential, 1);
-  d.close();
+  assert.equal((await db().prepare("SELECT confidential FROM tickets WHERE id = ?").get(ticketId)).confidential, 1);
 
   const offRes = await itClient.postForm(`/dashboard/tickets/${ticketId}/confidential`, { _csrf: csrf });
   assert.equal(offRes.status, 302);
-  const d2 = db();
-  assert.equal(d2.prepare("SELECT confidential FROM tickets WHERE id = ?").get(ticketId).confidential, 0);
-  d2.close();
+  assert.equal((await db().prepare("SELECT confidential FROM tickets WHERE id = ?").get(ticketId)).confidential, 0);
 });
 
 test("CSV export only includes the acting agent's own department's tickets", async () => {
-  createTicketDirect({ subject: "CSV IT ticket", category: "Hardware" });
-  createTicketDirect({ subject: "CSV HR ticket", category: "Benefits" });
+  await createTicketDirect({ subject: "CSV IT ticket", category: "Hardware" });
+  await createTicketDirect({ subject: "CSV HR ticket", category: "Benefits" });
 
   const csv = await (await itClient.get("/dashboard/export.csv")).text();
   assert.match(csv, /CSV IT ticket/);
@@ -262,8 +237,8 @@ test("CSV export only includes the acting agent's own department's tickets", asy
 });
 
 test("dashboard full-text search never surfaces a result outside the acting agent's department", async () => {
-  createTicketDirect({ subject: "Searchable widget failure", category: "Hardware" });
-  createTicketDirect({ subject: "Searchable widget failure but HR", category: "Benefits" });
+  await createTicketDirect({ subject: "Searchable widget failure", category: "Hardware" });
+  await createTicketDirect({ subject: "Searchable widget failure but HR", category: "Benefits" });
 
   const html = await (await itClient.get("/dashboard?q=widget")).text();
   assert.match(html, /Searchable widget failure</);
@@ -271,7 +246,7 @@ test("dashboard full-text search never surfaces a result outside the acting agen
 });
 
 test("bulk actions silently skip a ticket id outside the acting agent's department instead of applying to it", async () => {
-  const hrTicketId = createTicketDirect({ subject: "Bulk-targeted HR ticket", category: "Onboarding" });
+  const hrTicketId = await createTicketDirect({ subject: "Bulk-targeted HR ticket", category: "Onboarding" });
 
   const page = await itClient.get("/dashboard");
   const csrf = extractCsrf(await page.text());
@@ -284,21 +259,21 @@ test("bulk actions silently skip a ticket id outside the acting agent's departme
   });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT status FROM tickets WHERE id = ?").get(hrTicketId);
-  d.close();
+  
+  const row = await db().prepare("SELECT status FROM tickets WHERE id = ?").get(hrTicketId);
+
   assert.equal(row.status, "Open", "a ticket outside the agent's department must not be changed by a bulk action");
 });
 
 test("merging two tickets from different departments is rejected, even though both individually exist", async () => {
-  const itAgentId = agentId("it-agent@example.com");
-  const itTicketId = createTicketDirect({ subject: "IT side of a bad merge", category: "Hardware", assignedTo: itAgentId });
+  const itAgentId = await agentId("it-agent@example.com");
+  const itTicketId = await createTicketDirect({ subject: "IT side of a bad merge", category: "Hardware", assignedTo: itAgentId });
 
   // The target has to be visible to the acting agent to even attempt the
   // merge - use an admin (who can see both sides) to exercise the
   // department-mismatch rejection itself, not the separate 404 visibility
   // check already covered above.
-  const hrTicketId = createTicketDirect({ subject: "HR side of a bad merge", category: "Benefits" });
+  const hrTicketId = await createTicketDirect({ subject: "HR side of a bad merge", category: "Benefits" });
 
   const page = await adminClient.get(`/dashboard/tickets/${itTicketId}`);
   const csrf = extractCsrf(await page.text());
@@ -311,9 +286,9 @@ test("merging two tickets from different departments is rejected, even though bo
   const html = await res.text();
   assert.match(html, /different departments/);
 
-  const d = db();
-  const row = d.prepare("SELECT merged_into_id FROM tickets WHERE id = ?").get(itTicketId);
-  d.close();
+  
+  const row = await db().prepare("SELECT merged_into_id FROM tickets WHERE id = ?").get(itTicketId);
+
   assert.equal(row.merged_into_id, null, "the merge must not have gone through");
 });
 
@@ -327,10 +302,10 @@ test("auto-assignment (round-robin) on a publicly submitted ticket only ever pic
   });
   const ticketId = res.headers.get("location").match(/confirmation\/(\d+)/)[1];
 
-  const d = db();
-  const ticket = d.prepare("SELECT assigned_to FROM tickets WHERE id = ?").get(Number(ticketId));
-  const assignee = ticket.assigned_to ? d.prepare("SELECT department_id FROM agents WHERE id = ?").get(ticket.assigned_to) : null;
-  d.close();
+  
+  const ticket = await db().prepare("SELECT assigned_to FROM tickets WHERE id = ?").get(Number(ticketId));
+  const assignee = ticket.assigned_to ? await db().prepare("SELECT department_id FROM agents WHERE id = ?").get(ticket.assigned_to) : null;
+
 
   assert.ok(assignee, "an HR agent exists in this test's fixtures, so the ticket should have been auto-assigned");
   assert.equal(assignee.department_id, 2, "an HR-category ticket must only ever be auto-assigned to an HR agent");
@@ -354,8 +329,8 @@ test("an agent can only file a walk-in ticket under their own department's categ
 });
 
 test("assigning a ticket to an agent outside its department is rejected", async () => {
-  const hrAgentId = agentId("hr-agent@example.com");
-  const itTicketId = createTicketDirect({ subject: "Cross-department assign attempt", category: "Hardware" });
+  const hrAgentId = await agentId("hr-agent@example.com");
+  const itTicketId = await createTicketDirect({ subject: "Cross-department assign attempt", category: "Hardware" });
 
   const page = await itClient.get(`/dashboard/tickets/${itTicketId}`);
   const csrf = extractCsrf(await page.text());
@@ -366,15 +341,15 @@ test("assigning a ticket to an agent outside its department is rejected", async 
   });
   assert.equal(res.status, 400);
 
-  const d = db();
-  const row = d.prepare("SELECT assigned_to FROM tickets WHERE id = ?").get(itTicketId);
-  d.close();
+  
+  const row = await db().prepare("SELECT assigned_to FROM tickets WHERE id = ?").get(itTicketId);
+
   assert.equal(row.assigned_to, null, "the cross-department assignment must not have gone through");
 });
 
 test("an admin can be assigned any ticket regardless of department", async () => {
-  const adminId = agentId("admin-agent@example.com");
-  const hrTicketId = createTicketDirect({ subject: "Assign to admin", category: "Benefits" });
+  const adminId = await agentId("admin-agent@example.com");
+  const hrTicketId = await createTicketDirect({ subject: "Assign to admin", category: "Benefits" });
 
   const page = await adminClient.get(`/dashboard/tickets/${hrTicketId}`);
   const csrf = extractCsrf(await page.text());
@@ -385,15 +360,15 @@ test("an admin can be assigned any ticket regardless of department", async () =>
   });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT assigned_to FROM tickets WHERE id = ?").get(hrTicketId);
-  d.close();
+  
+  const row = await db().prepare("SELECT assigned_to FROM tickets WHERE id = ?").get(hrTicketId);
+
   assert.equal(row.assigned_to, adminId);
 });
 
 test("the dashboard reports (volume/category/status) are scoped to the acting agent's own department", async () => {
-  createTicketDirect({ subject: "Report scope IT", category: "Software" });
-  createTicketDirect({ subject: "Report scope HR", category: "Employee Relations" });
+  await createTicketDirect({ subject: "Report scope IT", category: "Software" });
+  await createTicketDirect({ subject: "Report scope HR", category: "Employee Relations" });
 
   const html = await (await itClient.get("/dashboard?report_range=30d")).text();
   assert.match(html, /Software/);
@@ -401,17 +376,17 @@ test("the dashboard reports (volume/category/status) are scoped to the acting ag
 });
 
 test("KB articles and canned responses scoped to a department don't show up for a different department's agent", async () => {
-  const d = db();
-  d.prepare("INSERT INTO kb_articles (title, slug, body, department_id) VALUES (?, ?, ?, 2)").run(
+  
+  await db().prepare("INSERT INTO kb_articles (title, slug, body, department_id) VALUES (?, ?, ?, 2)").run(
     "HR-only article",
     "hr-only-article",
     "body text"
   );
-  d.prepare("INSERT INTO canned_responses (title, body, department_id) VALUES (?, ?, 2)").run(
+  await db().prepare("INSERT INTO canned_responses (title, body, department_id) VALUES (?, ?, 2)").run(
     "HR-only canned response",
     "canned body"
   );
-  d.close();
+
 
   const kbHtml = await (await itClient.get("/dashboard/kb")).text();
   assert.doesNotMatch(kbHtml, /HR-only article/);
@@ -427,14 +402,14 @@ test("KB articles and canned responses scoped to a department don't show up for 
 });
 
 test("a department-scoped automation rule only fires for that department's tickets", async () => {
-  const d = db();
+  
   // action_tag-only rule, scoped to HR (department_id 2), triggered by any
   // ticket in the "Onboarding" category (also HR) - keeps the test to one
   // rule/one condition while still proving cross-department isolation.
-  d.prepare(
+  await db().prepare(
     `INSERT INTO automation_rules (name, condition_category, action_tag, department_id) VALUES (?, 'Onboarding', 'hr-tagged', 2)`
   ).run("HR-only tagging rule");
-  d.close();
+
 
   const hrRes = await client.postForm("/", {
     requester_name: "Automation HR",
@@ -445,11 +420,10 @@ test("a department-scoped automation rule only fires for that department's ticke
   });
   const hrTicketId = hrRes.headers.get("location").match(/confirmation\/(\d+)/)[1];
 
-  const d2 = db();
-  const hrTags = d2
+  const hrTags = await db()
     .prepare("SELECT tags.name FROM ticket_tags JOIN tags ON tags.id = ticket_tags.tag_id WHERE ticket_id = ?")
     .all(Number(hrTicketId));
-  d2.close();
+
   assert.ok(hrTags.some((t) => t.name === "hr-tagged"), "the HR-scoped rule should have tagged the HR ticket");
 });
 
@@ -467,9 +441,9 @@ test("departments and categories settings page lists seeded departments and can 
   const res = await adminClient.postForm("/dashboard/settings/departments", { name: "Operations", _csrf: csrf });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT id FROM departments WHERE name = ?").get("Operations");
-  d.close();
+  
+  const row = await db().prepare("SELECT id FROM departments WHERE name = ?").get("Operations");
+
   assert.ok(row, "the new department should have been created");
 });
 
@@ -478,13 +452,13 @@ test("the Agents page shows and can change an agent's department and admin flag"
   const html = await page.text();
   const csrf = extractCsrf(html);
 
-  const targetId = agentId("hr-agent@example.com");
+  const targetId = await agentId("hr-agent@example.com");
   const res = await adminClient.postForm(`/dashboard/agents/${targetId}/department`, { department_id: "1", _csrf: csrf });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT department_id FROM agents WHERE id = ?").get(targetId);
-  d.close();
+  
+  const row = await db().prepare("SELECT department_id FROM agents WHERE id = ?").get(targetId);
+
   assert.equal(row.department_id, 1, "the agent's department should now be IT");
 });
 
@@ -496,13 +470,13 @@ test("a non-admin agent can't view or manage the Agents page, including granting
   // request can't grant admin either - this is the exact gap being closed:
   // is_admin used to be settable by any logged-in agent.
   const homeCsrf = extractCsrf(await (await itClient.get("/dashboard")).text());
-  const targetId = agentId("hr-agent@example.com");
+  const targetId = await agentId("hr-agent@example.com");
   const postRes = await itClient.postForm(`/dashboard/agents/${targetId}/admin`, { is_admin: "1", _csrf: homeCsrf });
   assert.equal(postRes.status, 403);
 
-  const d = db();
-  const row = d.prepare("SELECT is_admin FROM agents WHERE id = ?").get(targetId);
-  d.close();
+  
+  const row = await db().prepare("SELECT is_admin FROM agents WHERE id = ?").get(targetId);
+
   assert.equal(row.is_admin, 0, "the target agent must not have been granted admin");
 });
 
@@ -514,7 +488,7 @@ test("a non-admin agent can't view or manage the Agents page, including granting
 // Legal specifically (rather than reusing IT/HR) so this exercises a
 // department none of the tests above have touched yet.
 test("Transfer to department: admin can move a ticket, which logs activity and immediately flips visibility to the target department", async () => {
-  const itTicketId = createTicketDirect({ subject: "Misfiled with IT, actually a Legal matter", category: "Hardware" });
+  const itTicketId = await createTicketDirect({ subject: "Misfiled with IT, actually a Legal matter", category: "Hardware" });
 
   // Visible to the sending department before the transfer...
   const beforeIt = await itClient.get(`/dashboard/tickets/${itTicketId}`);
@@ -532,10 +506,10 @@ test("Transfer to department: admin can move a ticket, which logs activity and i
   });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT category FROM tickets WHERE id = ?").get(itTicketId);
-  const activity = d.prepare("SELECT body FROM ticket_activity WHERE ticket_id = ? ORDER BY id DESC LIMIT 1").get(itTicketId);
-  d.close();
+  
+  const row = await db().prepare("SELECT category FROM tickets WHERE id = ?").get(itTicketId);
+  const activity = await db().prepare("SELECT body FROM ticket_activity WHERE ticket_id = ? ORDER BY id DESC LIMIT 1").get(itTicketId);
+
   assert.equal(row.category, "Contract Review", "the ticket's category should now be the Legal category that was picked");
   assert.match(activity.body, /Transferred from IT to Legal by Admin Agent\./, "the transfer should be logged as ticket activity naming both departments and who did it");
 
@@ -550,22 +524,22 @@ test("Transfer to department: admin can move a ticket, which logs activity and i
 });
 
 test("Transfer to department unassigns a ticket whose current assignee isn't in the target department", async () => {
-  const itAgentId = agentId("it-agent@example.com");
-  const ticketId = createTicketDirect({ subject: "Assigned in IT, transferred to Legal", category: "Software", assignedTo: itAgentId });
+  const itAgentId = await agentId("it-agent@example.com");
+  const ticketId = await createTicketDirect({ subject: "Assigned in IT, transferred to Legal", category: "Software", assignedTo: itAgentId });
 
   const page = await adminClient.get(`/dashboard/tickets/${ticketId}`);
   const csrf = extractCsrf(await page.text());
   const res = await adminClient.postForm(`/dashboard/tickets/${ticketId}/transfer`, { category: "Compliance", _csrf: csrf });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT assigned_to FROM tickets WHERE id = ?").get(ticketId);
-  d.close();
+  
+  const row = await db().prepare("SELECT assigned_to FROM tickets WHERE id = ?").get(ticketId);
+
   assert.equal(row.assigned_to, null, "the IT agent is not in Legal, so the transfer should have unassigned the ticket rather than leave a stale cross-department assignment");
 });
 
 test("a non-admin agent can't transfer a ticket to another department", async () => {
-  const ticketId = createTicketDirect({ subject: "Non-admin transfer attempt", category: "Hardware" });
+  const ticketId = await createTicketDirect({ subject: "Non-admin transfer attempt", category: "Hardware" });
 
   const page = await itClient.get(`/dashboard/tickets/${ticketId}`);
   const csrf = extractCsrf(await page.text());
@@ -573,26 +547,26 @@ test("a non-admin agent can't transfer a ticket to another department", async ()
   const res = await itClient.postForm(`/dashboard/tickets/${ticketId}/transfer`, { category: "Contract Review", _csrf: csrf });
   assert.equal(res.status, 403);
 
-  const d = db();
-  const row = d.prepare("SELECT category FROM tickets WHERE id = ?").get(ticketId);
-  d.close();
+  
+  const row = await db().prepare("SELECT category FROM tickets WHERE id = ?").get(ticketId);
+
   assert.equal(row.category, "Hardware", "a non-admin's transfer attempt must not have changed the ticket's category");
 });
 
 test("transferring to the ticket's own current category is a harmless no-op", async () => {
-  const ticketId = createTicketDirect({ subject: "Transfer to same category", category: "Hardware" });
+  const ticketId = await createTicketDirect({ subject: "Transfer to same category", category: "Hardware" });
 
   const page = await adminClient.get(`/dashboard/tickets/${ticketId}`);
   const csrf = extractCsrf(await page.text());
   const res = await adminClient.postForm(`/dashboard/tickets/${ticketId}/transfer`, { category: "Hardware", _csrf: csrf });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT category FROM tickets WHERE id = ?").get(ticketId);
-  const activityCount = d.prepare("SELECT COUNT(*) AS c FROM ticket_activity WHERE ticket_id = ?").get(ticketId).c;
-  d.close();
+  
+  const row = await db().prepare("SELECT category FROM tickets WHERE id = ?").get(ticketId);
+  const activityCountRow = await db().prepare("SELECT COUNT(*) AS c FROM ticket_activity WHERE ticket_id = ?").get(ticketId);
+
   assert.equal(row.category, "Hardware");
-  assert.equal(activityCount, 0, "picking the ticket's own current category should not log a spurious transfer activity row");
+  assert.equal(activityCountRow.c, 0, "picking the ticket's own current category should not log a spurious transfer activity row");
 });
 
 // ---- Department capacity --------------------------------------------------
@@ -603,34 +577,32 @@ test("transferring to the ticket's own current category is a harmless no-op", as
 // already transferred a couple of tickets into it - an exact hardcoded
 // count would make this test fragile/order-dependent.
 test("department capacity: a regular agent sees only their own department's row, an admin sees every department", async () => {
-  createTicketDirect({ subject: "Legal capacity ticket 1", category: "Contract Review" });
-  createTicketDirect({ subject: "Legal capacity ticket 2", category: "NDA / Confidentiality" });
-  createTicketDirect({ subject: "Marketing capacity ticket (resolved, should not count)", category: "Campaign Request" });
-  const d0 = db();
-  d0.prepare("UPDATE tickets SET status = 'Resolved' WHERE subject = 'Marketing capacity ticket (resolved, should not count)'").run();
-  d0.close();
+  await createTicketDirect({ subject: "Legal capacity ticket 1", category: "Contract Review" });
+  await createTicketDirect({ subject: "Legal capacity ticket 2", category: "NDA / Confidentiality" });
+  await createTicketDirect({ subject: "Marketing capacity ticket (resolved, should not count)", category: "Campaign Request" });
+  await db().prepare("UPDATE tickets SET status = 'Resolved' WHERE subject = 'Marketing capacity ticket (resolved, should not count)'").run();
+
   // One genuinely open Marketing ticket, and no Marketing agent at all -
   // exercises the "0 agents" edge case in the same assertion pass.
-  createTicketDirect({ subject: "Marketing capacity ticket (open)", category: "Brand Assets" });
+  await createTicketDirect({ subject: "Marketing capacity ticket (open)", category: "Brand Assets" });
 
-  function capacityPattern(departmentId) {
-    const d = db();
-    const openCount = d
+  async function capacityPattern(departmentId) {
+    const openCountRow = await db()
       .prepare(
         `SELECT COUNT(*) AS c FROM tickets
          JOIN categories ON categories.name = tickets.category
          WHERE categories.department_id = ? AND tickets.status IN ('Open', 'In Progress')`
       )
-      .get(departmentId).c;
-    const agentCount = d
+      .get(departmentId);
+    const agentCountRow = await db()
       .prepare("SELECT COUNT(*) AS c FROM agents WHERE department_id = ? AND active = 1 AND is_admin = 0")
-      .get(departmentId).c;
-    d.close();
-    return new RegExp(`${openCount} open[^<]*&middot;[^<]*${agentCount} agent`);
+      .get(departmentId);
+
+    return new RegExp(`${openCountRow.c} open[^<]*&middot;[^<]*${agentCountRow.c} agent`);
   }
 
-  const legalPattern = capacityPattern(3);
-  const marketingPattern = capacityPattern(4); // 1 open, 0 agents
+  const legalPattern = await capacityPattern(3);
+  const marketingPattern = await capacityPattern(4); // 1 open, 0 agents
 
   const legalHtml = await (await legalClient.get("/dashboard")).text();
   assert.match(legalHtml, /Department capacity/);

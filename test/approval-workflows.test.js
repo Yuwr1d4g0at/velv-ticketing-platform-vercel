@@ -6,7 +6,6 @@
 // migration in src/db/index.js).
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -21,7 +20,7 @@ async function loginAs(c, email) {
 before(async () => {
   app = await startTestApp();
 
-  const d = new DatabaseSync(app.dbPath);
+  const d = app.db;
   const passwordHash = bcrypt.hashSync("correct-password", 4);
   // IT (id 1) and Marketing (id 4) - seeded in that fixed order by
   // src/db/index.js's DEFAULT_DEPARTMENTS on a fresh database. Content &
@@ -30,22 +29,15 @@ before(async () => {
   // Marketing (department-scoped visibility - see src/departments.js -
   // still applies underneath the approval gate; it's a layer on top, not a
   // replacement).
-  d.prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, 1)").run(
-    "Approval Test IT Agent",
-    "approval-it-agent@example.com",
-    passwordHash
-  );
-  d.prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, 4)").run(
-    "Approval Test Marketing Agent",
-    "approval-marketing-agent@example.com",
-    passwordHash
-  );
-  d.prepare("INSERT INTO agents (name, email, password_hash, department_id, is_admin) VALUES (?, ?, ?, 1, 1)").run(
-    "Approval Test Admin",
-    "approval-admin@example.com",
-    passwordHash
-  );
-  d.close();
+  await d
+    .prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, 1)")
+    .run("Approval Test IT Agent", "approval-it-agent@example.com", passwordHash);
+  await d
+    .prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, 4)")
+    .run("Approval Test Marketing Agent", "approval-marketing-agent@example.com", passwordHash);
+  await d
+    .prepare("INSERT INTO agents (name, email, password_hash, department_id, is_admin) VALUES (?, ?, ?, 1, 1)")
+    .run("Approval Test Admin", "approval-admin@example.com", passwordHash);
 
   agentClient = makeClient(app.baseUrl);
   marketingClient = makeClient(app.baseUrl);
@@ -58,18 +50,16 @@ before(async () => {
 after(() => app.close());
 
 function db() {
-  return new DatabaseSync(app.dbPath);
+  return app.db;
 }
 
-function createTicketDirect({ subject, category, assignedTo = null }) {
-  const d = db();
-  const result = d
+async function createTicketDirect({ subject, category, assignedTo = null }) {
+  const result = await db()
     .prepare(
       `INSERT INTO tickets (subject, description, category, requester_name, requester_email, assigned_to)
        VALUES (?, 'desc', ?, 'Req', 'req@example.com', ?)`
     )
     .run(subject, category, assignedTo);
-  d.close();
   return result.lastInsertRowid;
 }
 
@@ -78,10 +68,8 @@ async function statusCsrf(client, ticketId) {
   return extractCsrf(await page.text());
 }
 
-test("Marketing's Content & Design and Campaign Request categories require approval by default; other categories don't", () => {
-  const d = db();
-  const rows = d.prepare("SELECT name, requires_approval FROM categories").all();
-  d.close();
+test("Marketing's Content & Design and Campaign Request categories require approval by default; other categories don't", async () => {
+  const rows = await db().prepare("SELECT name, requires_approval FROM categories").all();
 
   const byName = Object.fromEntries(rows.map((r) => [r.name, r.requires_approval]));
   assert.equal(byName["Content & Design"], 1, "Content & Design should default to requiring approval");
@@ -91,29 +79,25 @@ test("Marketing's Content & Design and Campaign Request categories require appro
 });
 
 test("REGRESSION: a category that does NOT require approval closes directly, exactly as before", async () => {
-  const ticketId = createTicketDirect({ subject: "Plain IT close", category: "Hardware" });
+  const ticketId = await createTicketDirect({ subject: "Plain IT close", category: "Hardware" });
   const csrf = await statusCsrf(agentClient, ticketId);
 
   const res = await agentClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Closed", _csrf: csrf });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
-  d.close();
+  const row = await db().prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
   assert.equal(row.status, "Closed", "a non-gated category should close immediately");
   assert.equal(row.approval_status, null, "approval_status must stay untouched for a category that doesn't use the gate");
 });
 
 test("a category flagged requires_approval blocks a direct close and parks the ticket pending instead", async () => {
-  const ticketId = createTicketDirect({ subject: "Needs sign-off", category: "Content & Design" });
+  const ticketId = await createTicketDirect({ subject: "Needs sign-off", category: "Content & Design" });
   const csrf = await statusCsrf(marketingClient, ticketId);
 
   const res = await marketingClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Closed", _csrf: csrf });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
-  d.close();
+  const row = await db().prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
   assert.notEqual(row.status, "Closed", "the ticket must not actually close while approval is pending");
   assert.equal(row.approval_status, "pending");
 
@@ -122,19 +106,19 @@ test("a category flagged requires_approval blocks a direct close and parks the t
 });
 
 test("submitting for approval is logged as ticket activity", async () => {
-  const ticketId = createTicketDirect({ subject: "Activity on submit", category: "Content & Design" });
+  const ticketId = await createTicketDirect({ subject: "Activity on submit", category: "Content & Design" });
   const csrf = await statusCsrf(marketingClient, ticketId);
   await marketingClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Closed", _csrf: csrf });
 
-  const d = db();
-  const row = d.prepare("SELECT type, body FROM ticket_activity WHERE ticket_id = ? AND type = 'approval_change'").get(ticketId);
-  d.close();
+  const row = await db()
+    .prepare("SELECT type, body FROM ticket_activity WHERE ticket_id = ? AND type = 'approval_change'")
+    .get(ticketId);
   assert.ok(row, "an approval_change activity row should exist");
   assert.match(row.body, /Submitted for approval/i);
 });
 
 test("a non-admin agent cannot approve or reject a pending ticket", async () => {
-  const ticketId = createTicketDirect({ subject: "Non-admin approve attempt", category: "Content & Design", assignedTo: null });
+  const ticketId = await createTicketDirect({ subject: "Non-admin approve attempt", category: "Content & Design", assignedTo: null });
   const csrf = await statusCsrf(marketingClient, ticketId);
   await marketingClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Closed", _csrf: csrf });
 
@@ -144,15 +128,13 @@ test("a non-admin agent cannot approve or reject a pending ticket", async () => 
   const rejectRes = await marketingClient.postForm(`/dashboard/tickets/${ticketId}/approval/reject`, { _csrf: csrf2 });
   assert.equal(rejectRes.status, 403);
 
-  const d = db();
-  const row = d.prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
-  d.close();
+  const row = await db().prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
   assert.equal(row.approval_status, "pending", "neither forged action should have changed the pending decision");
   assert.notEqual(row.status, "Closed");
 });
 
 test("an admin can approve a pending ticket, which then actually closes and logs activity", async () => {
-  const ticketId = createTicketDirect({ subject: "Approve me", category: "Campaign Request" });
+  const ticketId = await createTicketDirect({ subject: "Approve me", category: "Campaign Request" });
   const csrf = await statusCsrf(marketingClient, ticketId);
   await marketingClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Closed", _csrf: csrf });
 
@@ -160,10 +142,8 @@ test("an admin can approve a pending ticket, which then actually closes and logs
   const res = await adminClient.postForm(`/dashboard/tickets/${ticketId}/approval/approve`, { _csrf: csrf2 });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
-  const activity = d.prepare("SELECT type, body FROM ticket_activity WHERE ticket_id = ? ORDER BY id").all(ticketId);
-  d.close();
+  const row = await db().prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
+  const activity = await db().prepare("SELECT type, body FROM ticket_activity WHERE ticket_id = ? ORDER BY id").all(ticketId);
   assert.equal(row.status, "Closed", "approval should let the ticket actually close");
   assert.equal(row.approval_status, "approved");
   assert.ok(activity.some((a) => a.type === "approval_change" && /Approved/.test(a.body)));
@@ -171,7 +151,7 @@ test("an admin can approve a pending ticket, which then actually closes and logs
 });
 
 test("an admin can reject a pending ticket with a reviewer note; it stays open and the note shows on the ticket page", async () => {
-  const ticketId = createTicketDirect({ subject: "Reject me", category: "Content & Design" });
+  const ticketId = await createTicketDirect({ subject: "Reject me", category: "Content & Design" });
   const csrf = await statusCsrf(marketingClient, ticketId);
   await marketingClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Closed", _csrf: csrf });
 
@@ -182,10 +162,10 @@ test("an admin can reject a pending ticket with a reviewer note; it stays open a
   });
   assert.equal(res.status, 302);
 
-  const d = db();
-  const row = d.prepare("SELECT status, approval_status, approval_note FROM tickets WHERE id = ?").get(ticketId);
-  const activity = d.prepare("SELECT type, body FROM ticket_activity WHERE ticket_id = ? AND type = 'approval_change'").all(ticketId);
-  d.close();
+  const row = await db().prepare("SELECT status, approval_status, approval_note FROM tickets WHERE id = ?").get(ticketId);
+  const activity = await db()
+    .prepare("SELECT type, body FROM ticket_activity WHERE ticket_id = ? AND type = 'approval_change'")
+    .all(ticketId);
   assert.notEqual(row.status, "Closed", "a rejected ticket must not close");
   assert.equal(row.approval_status, "rejected");
   assert.equal(row.approval_note, "Please fix the brand colors before resubmitting.");
@@ -197,7 +177,7 @@ test("an admin can reject a pending ticket with a reviewer note; it stays open a
 });
 
 test("after a rejection, resubmitting (selecting Closed again) re-enters the pending gate", async () => {
-  const ticketId = createTicketDirect({ subject: "Resubmit after reject", category: "Content & Design" });
+  const ticketId = await createTicketDirect({ subject: "Resubmit after reject", category: "Content & Design" });
   let csrf = await statusCsrf(marketingClient, ticketId);
   await marketingClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Closed", _csrf: csrf });
 
@@ -207,16 +187,14 @@ test("after a rejection, resubmitting (selecting Closed again) re-enters the pen
   csrf = await statusCsrf(marketingClient, ticketId);
   await marketingClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Closed", _csrf: csrf });
 
-  const d = db();
-  const row = d.prepare("SELECT status, approval_status, approval_note FROM tickets WHERE id = ?").get(ticketId);
-  d.close();
+  const row = await db().prepare("SELECT status, approval_status, approval_note FROM tickets WHERE id = ?").get(ticketId);
   assert.equal(row.approval_status, "pending", "resubmitting should move it back to pending");
   assert.notEqual(row.status, "Closed");
   assert.equal(row.approval_note, null, "the stale rejection note should be cleared on resubmit");
 });
 
 test("approve/reject 400s if the ticket isn't actually pending", async () => {
-  const ticketId = createTicketDirect({ subject: "Not pending", category: "Content & Design" });
+  const ticketId = await createTicketDirect({ subject: "Not pending", category: "Content & Design" });
   const csrf = await statusCsrf(adminClient, ticketId);
 
   const res = await adminClient.postForm(`/dashboard/tickets/${ticketId}/approval/approve`, { _csrf: csrf });
@@ -224,7 +202,7 @@ test("approve/reject 400s if the ticket isn't actually pending", async () => {
 });
 
 test("reopening a previously approved-and-closed ticket clears the old approval decision, so it needs a fresh one to close again", async () => {
-  const ticketId = createTicketDirect({ subject: "Reopen after approval", category: "Campaign Request" });
+  const ticketId = await createTicketDirect({ subject: "Reopen after approval", category: "Campaign Request" });
   let csrf = await statusCsrf(marketingClient, ticketId);
   await marketingClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Closed", _csrf: csrf });
 
@@ -234,18 +212,14 @@ test("reopening a previously approved-and-closed ticket clears the old approval 
   csrf = await statusCsrf(marketingClient, ticketId);
   await marketingClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Open", _csrf: csrf });
 
-  let d = db();
-  let row = d.prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
-  d.close();
+  let row = await db().prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
   assert.equal(row.status, "Open");
   assert.equal(row.approval_status, null, "reopening should clear the previous approval decision");
 
   csrf = await statusCsrf(marketingClient, ticketId);
   await marketingClient.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Closed", _csrf: csrf });
 
-  d = db();
-  row = d.prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
-  d.close();
+  row = await db().prepare("SELECT status, approval_status FROM tickets WHERE id = ?").get(ticketId);
   assert.equal(row.approval_status, "pending", "closing again after a reopen must go through the gate again, not sail through on the old approval");
   assert.notEqual(row.status, "Closed");
 });
@@ -255,17 +229,13 @@ test("the departments/categories settings page can toggle a category's approval 
   const html = await page.text();
   const csrf = extractCsrf(html);
 
-  const d = db();
-  const category = d.prepare("SELECT id, requires_approval FROM categories WHERE name = 'Brand Assets'").get();
-  d.close();
+  const category = await db().prepare("SELECT id, requires_approval FROM categories WHERE name = 'Brand Assets'").get();
   assert.equal(category.requires_approval, 0);
 
   const res = await adminClient.postForm(`/dashboard/settings/departments/categories/${category.id}/approval-toggle`, { _csrf: csrf });
   assert.equal(res.status, 302);
 
-  const d2 = db();
-  const updated = d2.prepare("SELECT requires_approval FROM categories WHERE id = ?").get(category.id);
-  d2.close();
+  const updated = await db().prepare("SELECT requires_approval FROM categories WHERE id = ?").get(category.id);
   assert.equal(updated.requires_approval, 1, "toggling should now require approval for this category");
 
   // Toggle back off so this test doesn't leak state into any test that runs after it.

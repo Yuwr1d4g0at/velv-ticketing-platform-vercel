@@ -81,6 +81,14 @@ async function runPeriodicChecks() {
 // ~15-minute cadence for free; the daily cron is just the guaranteed floor for
 // nights/weekends when nobody's looking at the app at all.
 async function triggerOpportunistically() {
+  // Never fire from the test suite: it's unawaited by design (must never
+  // block a real dashboard response), which means it can still be mid-run
+  // when a later request starts - against test/helpers.js's isolated
+  // database, that's a real source of flakiness (competing for the same
+  // handful of pool connections, pruning sessions a test is mid-way through
+  // using), not just wasted work the way a rare double-fire is in
+  // production. See test/helpers.js's NODE_ENV="test".
+  if (process.env.NODE_ENV === "test") return;
   try {
     const row = await db.prepare("SELECT last_run_at FROM periodic_check_state WHERE id = 1").get();
     const ageMinutes =

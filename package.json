@@ -10,7 +10,7 @@
     "seed": "node src/db/seed.js",
     "migrate": "node scripts/migrate.js",
     "backup": "node scripts/backup.js",
-    "test": "node --test"
+    "test": "node --test --test-concurrency=1"
   },
   "engines": {
     "node": ">=22.5.0"

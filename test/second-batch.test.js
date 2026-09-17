@@ -1,6 +1,5 @@
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -9,23 +8,18 @@ let app, client, db;
 before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
-  db = new DatabaseSync(app.dbPath);
+  db = app.db;
 
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Batch Two Agent",
-    "batch-two@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Batch Two Agent", "batch-two@example.com", bcrypt.hashSync("correct-password", 4));
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
   await client.postForm("/login", { email: "batch-two@example.com", password: "correct-password", _csrf: csrf });
 });
 
-after(() => {
-  db.close();
-  return app.close();
-});
+after(() => app.close());
 
 async function submitTicket(fields) {
   const res = await client.postForm("/", {
@@ -87,13 +81,17 @@ test("SLA thresholds are editable and the change takes effect without a restart"
   });
   assert.equal(okRes.status, 302);
 
-  const row = db.prepare("SELECT days FROM sla_thresholds WHERE priority = 'Urgent'").get();
+  const row = await db.prepare("SELECT days FROM sla_thresholds WHERE priority = 'Urgent'").get();
   assert.equal(row.days, 3);
 
   // A ticket 2 days old at Urgent priority is now within the new 3-day
   // threshold (would have been "aging" under the old 1-day default).
   const ticketId = await submitTicket({ subject: "Should not be aging now" });
-  db.prepare("UPDATE tickets SET priority = 'Urgent', created_at = datetime('now', '-2 days') WHERE id = ?").run(ticketId);
+  await db
+    .prepare(
+      "UPDATE tickets SET priority = 'Urgent', created_at = to_char((now() AT TIME ZONE 'UTC') - INTERVAL '2 days', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?"
+    )
+    .run(ticketId);
   const ticketHtml = await (await client.get(`/dashboard/tickets/${ticketId}`)).text();
   assert.doesNotMatch(ticketHtml, /badge-aging/);
 });
@@ -143,7 +141,7 @@ test("webhooks: create, receive a signed POST on ticket creation, pause, and del
 test("agent-initiated ticket creation sets priority and assignment immediately, no round-robin", async () => {
   const page = await client.get("/dashboard/tickets/new");
   const csrf = extractCsrf(await page.text());
-  const agentRow = db.prepare("SELECT id FROM agents WHERE email = 'batch-two@example.com'").get();
+  const agentRow = await db.prepare("SELECT id FROM agents WHERE email = 'batch-two@example.com'").get();
 
   const res = await client.postForm("/dashboard/tickets/new", {
     requester_name: "Phone Caller",
@@ -158,7 +156,7 @@ test("agent-initiated ticket creation sets priority and assignment immediately, 
   assert.equal(res.status, 302);
   const ticketId = res.headers.get("location").match(/tickets\/(\d+)/)[1];
 
-  const ticket = db.prepare("SELECT * FROM tickets WHERE id = ?").get(ticketId);
+  const ticket = await db.prepare("SELECT * FROM tickets WHERE id = ?").get(ticketId);
   assert.equal(ticket.priority, "Urgent");
   assert.equal(ticket.assigned_to, agentRow.id);
 
@@ -208,12 +206,12 @@ test("warranty-expiry check emails active agents once, and a date change lets it
   });
   const assetId = createRes.headers.get("location").match(/assets\/(\d+)/)[1];
 
-  const firstRun = checkWarrantyAlerts();
+  const firstRun = await checkWarrantyAlerts();
   assert.ok(firstRun >= 1);
-  let asset = db.prepare("SELECT warranty_alerted_at FROM assets WHERE id = ?").get(assetId);
+  let asset = await db.prepare("SELECT warranty_alerted_at FROM assets WHERE id = ?").get(assetId);
   assert.ok(asset.warranty_alerted_at);
 
-  const secondRun = checkWarrantyAlerts();
+  const secondRun = await checkWarrantyAlerts();
   assert.equal(secondRun, 0); // already alerted, not re-sent
 
   // Renewing the warranty date clears the alert flag so it can fire again later.
@@ -226,7 +224,7 @@ test("warranty-expiry check emails active agents once, and a date change lets it
     warranty_expires: new Date(Date.now() + 400 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
     _csrf: editCsrf,
   });
-  asset = db.prepare("SELECT warranty_alerted_at FROM assets WHERE id = ?").get(assetId);
+  asset = await db.prepare("SELECT warranty_alerted_at FROM assets WHERE id = ?").get(assetId);
   assert.equal(asset.warranty_alerted_at, null);
 
   const listHtml = await (await client.get("/dashboard/assets")).text();

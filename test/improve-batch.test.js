@@ -4,7 +4,6 @@
 // again shortly after - see [[velv-ticketing-rebrand]].)
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -13,30 +12,25 @@ let app, client, db, agentId;
 before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
-  db = new DatabaseSync(app.dbPath);
+  db = app.db;
 
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Improve Agent",
-    "improve-agent@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
-  agentId = db.prepare("SELECT id FROM agents WHERE email = 'improve-agent@example.com'").get().id;
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Improve Agent", "improve-agent@example.com", bcrypt.hashSync("correct-password", 4));
+  agentId = (await db.prepare("SELECT id FROM agents WHERE email = 'improve-agent@example.com'").get()).id;
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
   await client.postForm("/login", { email: "improve-agent@example.com", password: "correct-password", _csrf: csrf });
 });
 
-after(() => {
-  db.close();
-  return app.close();
-});
+after(() => app.close());
 
-function insertTicket(fields = {}) {
-  const result = db
+async function insertTicket(fields = {}) {
+  const result = await db
     .prepare(
       `INSERT INTO tickets (subject, description, category, requester_name, requester_email, assigned_to, priority, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, now_text()))`
     )
     .run(
       fields.subject || "Default subject",
@@ -52,10 +46,10 @@ function insertTicket(fields = {}) {
   return result.lastInsertRowid;
 }
 
-function insertResolvedActivity(ticketId, happenedAt) {
-  db.prepare(
-    `INSERT INTO ticket_activity (ticket_id, agent_id, type, body, created_at) VALUES (?, ?, 'status_change', ?, ?)`
-  ).run(ticketId, agentId, 'Status changed from "Open" to "Resolved".', happenedAt);
+async function insertResolvedActivity(ticketId, happenedAt) {
+  await db
+    .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body, created_at) VALUES (?, ?, 'status_change', ?, ?)`)
+    .run(ticketId, agentId, 'Status changed from "Open" to "Resolved".', happenedAt);
 }
 
 test("Reports date range: defaults to Last 30 days, and presets change the label", async () => {
@@ -76,8 +70,8 @@ test("Reports date range: picking Custom range without dates yet reveals the dat
 });
 
 test("Reports date range: a custom range scopes the ticket-created volume and category breakdown to that window", async () => {
-  const inRange = insertTicket({ subject: "In-range widget", category: "Network", created_at: "2026-01-15 09:00:00" });
-  const outOfRange = insertTicket({ subject: "Out-of-range widget", category: "Network", created_at: "2020-01-15 09:00:00" });
+  const inRange = await insertTicket({ subject: "In-range widget", category: "Network", created_at: "2026-01-15 09:00:00" });
+  const outOfRange = await insertTicket({ subject: "Out-of-range widget", category: "Network", created_at: "2020-01-15 09:00:00" });
 
   const html = await (await client.get("/dashboard?report_range=custom&report_from=2026-01-01&report_to=2026-01-31")).text();
   assert.match(html, /2026-01-01 to 2026-01-31/);
@@ -86,7 +80,7 @@ test("Reports date range: a custom range scopes the ticket-created volume and ca
   // ...but a ticket from 2020 has no business appearing in a Jan 2026 window.
   assert.doesNotMatch(html, /2020-01-15/);
 
-  db.prepare("DELETE FROM tickets WHERE id IN (?, ?)").run(inRange, outOfRange);
+  await db.prepare("DELETE FROM tickets WHERE id IN (?, ?)").run(inRange, outOfRange);
 });
 
 test("SLA compliance trend: mixes a met and a breached resolution into one bucket's percentage", async () => {
@@ -94,29 +88,29 @@ test("SLA compliance trend: mixes a met and a breached resolution into one bucke
   // in the same day-bucket - one resolved within Medium's 45-business-hour
   // threshold, the other resolved two full weeks (90+ business hours) later
   // than its own creation, well past it.
-  const onTime = insertTicket({
+  const onTime = await insertTicket({
     subject: "Resolved quickly",
     priority: "Medium",
     status: "Resolved",
     created_at: "2026-01-19 09:00:00",
   });
-  insertResolvedActivity(onTime, "2026-01-19 11:00:00");
+  await insertResolvedActivity(onTime, "2026-01-19 11:00:00");
 
-  const late = insertTicket({
+  const late = await insertTicket({
     subject: "Resolved very late",
     priority: "Medium",
     status: "Resolved",
     created_at: "2026-01-05 09:00:00",
   });
-  insertResolvedActivity(late, "2026-01-19 10:00:00");
+  await insertResolvedActivity(late, "2026-01-19 10:00:00");
 
   const html = await (
     await client.get("/dashboard?report_range=custom&report_from=2026-01-01&report_to=2026-01-31")
   ).text();
   assert.match(html, /2026-01-19: 50% met \(1\/2 resolved\)/);
 
-  db.prepare("DELETE FROM ticket_activity WHERE ticket_id IN (?, ?)").run(onTime, late);
-  db.prepare("DELETE FROM tickets WHERE id IN (?, ?)").run(onTime, late);
+  await db.prepare("DELETE FROM ticket_activity WHERE ticket_id IN (?, ?)").run(onTime, late);
+  await db.prepare("DELETE FROM tickets WHERE id IN (?, ?)").run(onTime, late);
 });
 
 test("Company holidays: add, list, reject invalid input, and delete", async () => {
@@ -126,17 +120,17 @@ test("Company holidays: add, list, reject invalid input, and delete", async () =
   const bad = await client.postForm("/dashboard/settings/holidays", { date: "not-a-date", name: "Bad Holiday", _csrf: csrf });
   assert.equal(bad.status, 400);
   assert.match(await bad.text(), /Enter a valid date/);
-  assert.equal(db.prepare("SELECT COUNT(*) c FROM company_holidays WHERE name = 'Bad Holiday'").get().c, 0);
+  assert.equal((await db.prepare("SELECT COUNT(*) c FROM company_holidays WHERE name = 'Bad Holiday'").get()).c, 0);
 
   await client.postForm("/dashboard/settings/holidays", { date: "2026-12-25", name: "Test Christmas", _csrf: csrf });
   const listHtml = await (await client.get("/dashboard/settings/holidays")).text();
   assert.match(listHtml, /Test Christmas/);
   assert.match(listHtml, /2026-12-25/);
 
-  const row = db.prepare("SELECT id FROM company_holidays WHERE date = '2026-12-25'").get();
+  const row = await db.prepare("SELECT id FROM company_holidays WHERE date = '2026-12-25'").get();
   assert.ok(row);
 
   const csrf2 = extractCsrf(listHtml);
   await client.postForm(`/dashboard/settings/holidays/${row.id}/delete`, { _csrf: csrf2 });
-  assert.equal(db.prepare("SELECT COUNT(*) c FROM company_holidays WHERE id = ?").get(row.id).c, 0);
+  assert.equal((await db.prepare("SELECT COUNT(*) c FROM company_holidays WHERE id = ?").get(row.id)).c, 0);
 });

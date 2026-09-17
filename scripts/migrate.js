@@ -511,7 +511,15 @@ async function migrate() {
   }
 }
 
-migrate().catch((err) => {
-  console.error("Migration failed:", err);
-  process.exit(1);
-});
+// Runs immediately when invoked as a CLI script (`node scripts/migrate.js`),
+// but not when required as a module - test/helpers.js does exactly that, to
+// apply this same schema to the isolated test database before each test file
+// runs, without forking a child process just to run this script.
+if (require.main === module) {
+  migrate().catch((err) => {
+    console.error("Migration failed:", err);
+    process.exit(1);
+  });
+}
+
+module.exports = { migrate };

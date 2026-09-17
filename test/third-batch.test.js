@@ -1,6 +1,5 @@
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -9,23 +8,18 @@ let app, client, db;
 before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
-  db = new DatabaseSync(app.dbPath);
+  db = app.db;
 
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Jane Doe",
-    "jane@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Jane Doe", "jane@example.com", bcrypt.hashSync("correct-password", 4));
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
   await client.postForm("/login", { email: "jane@example.com", password: "correct-password", _csrf: csrf });
 });
 
-after(() => {
-  db.close();
-  return app.close();
-});
+after(() => app.close());
 
 async function submitTicket(fields) {
   const res = await client.postForm("/", {
@@ -90,7 +84,7 @@ test("ticket templates: loading one pre-fills the new-ticket form", async () => 
     _csrf: csrf,
   });
 
-  const templateRow = db.prepare("SELECT id FROM ticket_templates WHERE name = 'VPN access'").get();
+  const templateRow = await db.prepare("SELECT id FROM ticket_templates WHERE name = 'VPN access'").get();
   const prefilled = await (await client.get(`/dashboard/tickets/new?template=${templateRow.id}`)).text();
   assert.match(prefilled, /New VPN access request/);
   assert.match(prefilled, /Please grant VPN access for the new hire\./);
@@ -102,12 +96,10 @@ test("ticket templates: loading one pre-fills the new-ticket form", async () => 
 test("an agent can watch and unwatch a ticket they're not assigned to", async () => {
   const ticketId = await submitTicket({ subject: "Watcher notification test" });
 
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Watcher Agent",
-    "watcher@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
-  const watcherAgent = db.prepare("SELECT id FROM agents WHERE email = 'watcher@example.com'").get();
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Watcher Agent", "watcher@example.com", bcrypt.hashSync("correct-password", 4));
+  const watcherAgent = await db.prepare("SELECT id FROM agents WHERE email = 'watcher@example.com'").get();
 
   const ticketPage = await client.get(`/dashboard/tickets/${ticketId}`);
   const csrf = extractCsrf(await ticketPage.text());
@@ -133,11 +125,11 @@ test("an agent can watch and unwatch a ticket they're not assigned to", async ()
   const watchedPage = await (await client.get(`/dashboard/tickets/${ticketId}`)).text();
   assert.match(watchedPage, /Watched by Watcher Agent/);
 
-  const isWatching = db.prepare("SELECT 1 FROM ticket_watchers WHERE ticket_id = ? AND agent_id = ?").get(ticketId, watcherAgent.id);
+  const isWatching = await db.prepare("SELECT 1 FROM ticket_watchers WHERE ticket_id = ? AND agent_id = ?").get(ticketId, watcherAgent.id);
   assert.ok(isWatching);
 
   await watcherClient.postForm(`/dashboard/tickets/${ticketId}/unwatch`, { _csrf: wCsrf });
-  const unwatched = db.prepare("SELECT 1 FROM ticket_watchers WHERE ticket_id = ? AND agent_id = ?").get(ticketId, watcherAgent.id);
+  const unwatched = await db.prepare("SELECT 1 FROM ticket_watchers WHERE ticket_id = ? AND agent_id = ?").get(ticketId, watcherAgent.id);
   assert.equal(unwatched, undefined);
 });
 
@@ -178,7 +170,7 @@ test("a 1-2 star CSAT rating shows a low-rating banner on the ticket page", asyn
   const csrf = extractCsrf(await page.text());
   await client.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Resolved", _csrf: csrf });
 
-  const ticket = db.prepare("SELECT rating_token FROM tickets WHERE id = ?").get(ticketId);
+  const ticket = await db.prepare("SELECT rating_token FROM tickets WHERE id = ?").get(ticketId);
   const ratePage = await client.get(`/rate/${ticket.rating_token}`);
   const rateCsrf = extractCsrf(await ratePage.text());
   await client.postForm(`/rate/${ticket.rating_token}`, { rating: "1", comment: "Not happy.", _csrf: rateCsrf });
@@ -195,7 +187,7 @@ test("custom fields: only shown/saved for their own category, and display on the
     field_name: "System name",
     _csrf: csrf,
   });
-  const fieldRow = db.prepare("SELECT id FROM custom_field_definitions WHERE field_name = 'System name'").get();
+  const fieldRow = await db.prepare("SELECT id FROM custom_field_definitions WHERE field_name = 'System name'").get();
 
   // Submitted under the MATCHING category - should save.
   const matchRes = await client.postForm("/", {
@@ -207,7 +199,7 @@ test("custom fields: only shown/saved for their own category, and display on the
     [`custom_${fieldRow.id}`]: "SAP-42",
   });
   const matchTicketId = matchRes.headers.get("location").match(/confirmation\/(\d+)/)[1];
-  const savedValue = db
+  const savedValue = await db
     .prepare("SELECT value FROM ticket_custom_values WHERE ticket_id = ? AND field_definition_id = ?")
     .get(matchTicketId, fieldRow.id);
   assert.equal(savedValue.value, "SAP-42");
@@ -227,7 +219,7 @@ test("custom fields: only shown/saved for their own category, and display on the
     [`custom_${fieldRow.id}`]: "should-not-be-saved",
   });
   const mismatchTicketId = mismatchRes.headers.get("location").match(/confirmation\/(\d+)/)[1];
-  const notSaved = db
+  const notSaved = await db
     .prepare("SELECT value FROM ticket_custom_values WHERE ticket_id = ? AND field_definition_id = ?")
     .get(mismatchTicketId, fieldRow.id);
   assert.equal(notSaved, undefined);

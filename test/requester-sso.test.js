@@ -16,7 +16,6 @@
 // network-gated states in test/auth.test.js's sibling suite.
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const { startTestApp, makeClient } = require("./helpers");
 
 let app, client, db;
@@ -24,23 +23,26 @@ let app, client, db;
 before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
-  db = new DatabaseSync(app.dbPath);
+  db = app.db;
 });
 
-after(() => {
-  db.close();
-  return app.close();
-});
+after(() => app.close());
 
 // Injects a verified requester identity directly into a client's session
 // row (see the file-level comment above for why - no live Microsoft
 // round-trip in this test suite). `client` must have already made at least
-// one request so its session row exists.
-function injectRequesterSession(identity = { email: "verified.person@velv.pt", name: "Verified Person" }) {
-  const sessionRow = db.prepare("SELECT sid, data FROM sessions ORDER BY rowid DESC LIMIT 1").get();
-  const data = JSON.parse(sessionRow.data);
+// one request so its session row exists. The session table is
+// connect-pg-simple's own (see src/sessionStore.js): sid/sess/expire, no
+// SQLite-style rowid - "most recently created" is approximated by the
+// furthest-out expire timestamp instead (each session's expiry is set from
+// its own creation time + a fixed maxAge, so the newest session also has the
+// latest expiry). `sess` is a genuine json column - the driver hands it
+// back already parsed, no JSON.parse/stringify needed on either side.
+async function injectRequesterSession(identity = { email: "verified.person@velv.pt", name: "Verified Person" }) {
+  const sessionRow = await db.prepare("SELECT sid, sess FROM session ORDER BY expire DESC LIMIT 1").get();
+  const data = sessionRow.sess;
   data.requester = identity;
-  db.prepare("UPDATE sessions SET data = ? WHERE sid = ?").run(JSON.stringify(data), sessionRow.sid);
+  await db.prepare("UPDATE session SET sess = ? WHERE sid = ?").run(JSON.stringify(data), sessionRow.sid);
   return identity;
 }
 
@@ -59,7 +61,7 @@ test("once SSO is configured, the landing page replaces the form and submitting 
     assert.match(html, /Sign in with Microsoft/);
     assert.doesNotMatch(html, /name="requester_email"/);
 
-    const before = db.prepare("SELECT COUNT(*) c FROM tickets").get().c;
+    const before = (await db.prepare("SELECT COUNT(*) c FROM tickets").get()).c;
     const res = await client.postForm("/", {
       requester_name: "Nobody",
       requester_email: "nobody@example.com",
@@ -69,7 +71,7 @@ test("once SSO is configured, the landing page replaces the form and submitting 
     });
     assert.equal(res.status, 302);
     assert.equal(res.headers.get("location"), "/");
-    assert.equal(db.prepare("SELECT COUNT(*) c FROM tickets").get().c, before);
+    assert.equal((await db.prepare("SELECT COUNT(*) c FROM tickets").get()).c, before);
   } finally {
     delete process.env.MS_TENANT_ID;
     delete process.env.MS_CLIENT_ID;
@@ -84,7 +86,7 @@ test("once signed in, the form locks the identity and a submitted ticket always 
   try {
     const ssoClient = makeClient(app.baseUrl);
     await ssoClient.get("/"); // establishes a real session row (CSRF token generation writes to it)
-    injectRequesterSession();
+    await injectRequesterSession();
 
     const formHtml = await (await ssoClient.get("/")).text();
     assert.match(formHtml, /Submitting as/);
@@ -101,7 +103,7 @@ test("once signed in, the form locks the identity and a submitted ticket always 
     });
     assert.equal(res.status, 302);
     const ticketId = res.headers.get("location").match(/confirmation\/(\d+)/)[1];
-    const ticket = db.prepare("SELECT requester_name, requester_email FROM tickets WHERE id = ?").get(ticketId);
+    const ticket = await db.prepare("SELECT requester_name, requester_email FROM tickets WHERE id = ?").get(ticketId);
     assert.equal(ticket.requester_email, "verified.person@velv.pt");
     assert.equal(ticket.requester_name, "Verified Person");
   } finally {
@@ -148,21 +150,23 @@ test("once signed in, /status locks the email field to the session identity and 
   try {
     const ssoClient = makeClient(app.baseUrl);
     await ssoClient.get("/");
-    const identity = injectRequesterSession({ email: "status.checker@velv.pt", name: "Status Checker" });
+    const identity = await injectRequesterSession({ email: "status.checker@velv.pt", name: "Status Checker" });
 
     // A ticket that belongs to the signed-in identity should be findable...
-    const mine = db
+    const mineResult = await db
       .prepare(
         `INSERT INTO tickets (subject, description, category, requester_name, requester_email) VALUES (?, ?, 'Hardware', ?, ?)`
       )
-      .run("My own ticket", "desc", identity.name, identity.email).lastInsertRowid;
+      .run("My own ticket", "desc", identity.name, identity.email);
+    const mine = mineResult.lastInsertRowid;
     // ...but one belonging to someone else should not, even if the client
     // tries to submit that other email directly in the form body.
-    const someoneElses = db
+    const someoneElsesResult = await db
       .prepare(
         `INSERT INTO tickets (subject, description, category, requester_name, requester_email) VALUES (?, ?, 'Hardware', ?, ?)`
       )
-      .run("Someone else's ticket", "desc", "Other Person", "other.person@velv.pt").lastInsertRowid;
+      .run("Someone else's ticket", "desc", "Other Person", "other.person@velv.pt");
+    const someoneElses = someoneElsesResult.lastInsertRowid;
 
     const statusFormHtml = await (await ssoClient.get("/status")).text();
     assert.match(statusFormHtml, /Checking status as/);

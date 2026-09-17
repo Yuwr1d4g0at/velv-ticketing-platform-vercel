@@ -1,26 +1,61 @@
-// Test scaffolding: boots the real app (src/app.js) against a throwaway
-// SQLite file and an ephemeral port, with a tiny cookie-jar fetch client on
-// top since node's built-in fetch doesn't carry cookies between requests on
-// its own. No test framework dependency - just node:test + node:assert.
-const path = require("path");
-const fs = require("fs");
-const os = require("os");
-const crypto = require("crypto");
+// Test scaffolding: boots the real app (src/app.js) against a dedicated,
+// isolated Postgres database ("velv_test" - a separate database on the same
+// Neon project as dev/prod, created once via `CREATE DATABASE velv_test`,
+// never the same database dev/prod use) instead of a throwaway SQLite file,
+// since this app no longer has a synchronous, file-based database to spin up
+// fresh per test run. A tiny cookie-jar fetch client sits on top since
+// node's built-in fetch doesn't carry cookies between requests on its own.
+// No test framework dependency - just node:test + node:assert.
+//
+// node:test runs each test FILE in its own child process by default, so
+// there's no cross-file require-cache contamination the way there could be
+// within a single process - but every file shares the SAME velv_test
+// database, so `npm test` forces serial file execution
+// (--test-concurrency=1, see package.json) rather than letting multiple
+// files race each other truncating/seeding the same tables at once.
+require("dotenv").config();
 
-function tempDbPath() {
-  return path.join(os.tmpdir(), `velv-test-${crypto.randomBytes(8).toString("hex")}.sqlite`);
+// Same host/user/password/pooling params as the real DATABASE_URL, just a
+// different database name - swapping only the pathname, not hand-building a
+// connection string, so this stays correct however the pooler/SSL/etc.
+// query params are set up.
+function testDatabaseUrl() {
+  const url = new URL(process.env.DATABASE_URL);
+  url.pathname = "/velv_test";
+  return url.toString();
 }
 
 // Call once per test file (in a top-level `before`), not once per test case:
 // src/app.js and src/db/index.js are cached by node's require() the first
 // time they're loaded in this process, so a second call here would silently
-// reuse the first call's database rather than getting a fresh one.
+// reuse the first call's pool/app rather than getting a fresh one.
 async function startTestApp() {
-  const dbPath = tempDbPath();
-  process.env.DB_PATH = dbPath;
+  process.env.DATABASE_URL = testDatabaseUrl();
   process.env.SESSION_SECRET = "test-secret-not-for-production";
   process.env.COOKIE_SECURE = "false";
+  process.env.CRON_SECRET = "test-cron-secret-not-for-production";
+  // Suppresses the dashboard route's opportunistic background-checks trigger
+  // (see src/periodicChecks.js) - fire-and-forget by design, so it can still
+  // be mid-run when a later request starts, which against this shared,
+  // connection-limited test database is a real source of flakiness rather
+  // than the harmless wasted work a rare double-fire is in production.
+  process.env.NODE_ENV = "test";
   delete process.env.SMTP_HOST; // keep email notifications a no-op in tests
+  delete process.env.MS_TENANT_ID; // keep SSO/Graph a no-op in tests
+  delete process.env.MS_CLIENT_ID;
+  delete process.env.MS_CLIENT_SECRET;
+
+  // Wipe BEFORE migrating, not after: migrate() seed-if-empty's default
+  // reference data (departments, categories, SLA thresholds, ...) that
+  // agents/tickets/etc. depend on via foreign keys - wiping afterward would
+  // truncate that seed data right back out again, leaving e.g. every
+  // agent's department_id (DEFAULT 1) pointing at a department row that no
+  // longer exists.
+  const db = require("../src/db");
+  await wipeTestDatabase(db);
+
+  const { migrate } = require("../scripts/migrate");
+  await migrate();
 
   const app = require("../src/app");
 
@@ -33,12 +68,34 @@ async function startTestApp() {
 
   async function close() {
     await new Promise((resolve) => server.close(resolve));
-    for (const suffix of ["", "-wal", "-shm"]) {
-      fs.rmSync(dbPath + suffix, { force: true });
-    }
+    await db.pool.end();
   }
 
-  return { baseUrl: `http://127.0.0.1:${port}`, close, dbPath };
+  return { baseUrl: `http://127.0.0.1:${port}`, close, db };
+}
+
+// Wipes every application table so each test file starts from a genuinely
+// blank slate, regardless of what a previous file left behind - the direct
+// analogue of the old SQLite version always starting from a brand new,
+// empty temp file. RESTART IDENTITY resets SERIAL sequences back to 1 too,
+// so tests can assert on predictable ids (ticket #1, agent #1, ...) the same
+// way they could against a fresh SQLite file.
+//
+// Safe here specifically because velv_test is a dedicated, isolated
+// database that only ever holds throwaway test data - this would be a
+// catastrophic operation against the real dev/prod database, which is
+// exactly why this refuses to run against anything else (belt-and-braces on
+// top of testDatabaseUrl() above always pointing startTestApp() somewhere
+// else in the first place).
+async function wipeTestDatabase(db) {
+  const currentDb = (await db.pool.query("SELECT current_database() AS name")).rows[0].name;
+  if (currentDb !== "velv_test") {
+    throw new Error(`Refusing to wipe database "${currentDb}" - tests must run against "velv_test" only.`);
+  }
+  const { rows } = await db.pool.query("SELECT tablename FROM pg_tables WHERE schemaname = 'public'");
+  if (!rows.length) return;
+  const tableList = rows.map((r) => `"${r.tablename}"`).join(", ");
+  await db.pool.query(`TRUNCATE TABLE ${tableList} RESTART IDENTITY CASCADE`);
 }
 
 function makeClient(baseUrl) {
@@ -61,6 +118,19 @@ function makeClient(baseUrl) {
     }
   }
 
+  // Eagerly reads the whole body here, always - regardless of whether the
+  // caller ever calls .text() itself. A LOT of call sites across this test
+  // suite only check .status/.headers and never touch the body at all
+  // (e.g. `assert.equal(res.status, 302)` on a redirect). Undici (node's
+  // fetch client) needs a response body fully drained before its underlying
+  // socket is safe to reuse for a later request on this same client/agent -
+  // leaving a body unconsumed was a genuine, reproduced source of
+  // intermittent failures against this suite's real remote database (an
+  // in-flight next request occasionally landing before the previous
+  // connection had actually finished, most visible on the TOTP 2FA flow's
+  // tight timing). Wrapping every response so its body is read exactly once
+  // here removes the whole class of bug - every test call site keeps
+  // working unchanged (`.status`, `.headers.get(...)`, `await res.text()`).
   async function request(method, urlPath, { body, headers = {}, redirect = "manual" } = {}) {
     const res = await fetch(`${baseUrl}${urlPath}`, {
       method,
@@ -69,7 +139,14 @@ function makeClient(baseUrl) {
       body,
     });
     captureCookies(res);
-    return res;
+    const text = await res.text();
+    return {
+      status: res.status,
+      headers: res.headers,
+      ok: res.ok,
+      text: async () => text,
+      json: async () => JSON.parse(text),
+    };
   }
 
   return {

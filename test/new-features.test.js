@@ -1,6 +1,5 @@
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -9,23 +8,18 @@ let app, client, db;
 before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
-  db = new DatabaseSync(app.dbPath);
+  db = app.db;
 
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Feature Agent",
-    "feature-agent@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Feature Agent", "feature-agent@example.com", bcrypt.hashSync("correct-password", 4));
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
   await client.postForm("/login", { email: "feature-agent@example.com", password: "correct-password", _csrf: csrf });
 });
 
-after(() => {
-  db.close();
-  return app.close();
-});
+after(() => app.close());
 
 async function submitTicket(fields) {
   const res = await client.postForm("/", {
@@ -139,11 +133,9 @@ test("a requester checking status (or replying) on a merged-away ticket is trans
 });
 
 test("saved views: an agent can save, list, and delete their own view; can't delete another agent's", async () => {
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Other Agent",
-    "other-agent@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Other Agent", "other-agent@example.com", bcrypt.hashSync("correct-password", 4));
   const otherClient = makeClient(app.baseUrl);
   const otherLoginPage = await otherClient.get("/login");
   const otherCsrf = extractCsrf(await otherLoginPage.text());
@@ -175,30 +167,31 @@ test("SLA breach check emails once per breach and clears on reopen", async () =>
   const { checkSlaBreaches } = require("../src/sla");
   const ticketId = await submitTicket({ subject: "Aging urgent ticket" });
 
-  const agentRow = db.prepare("SELECT id FROM agents WHERE email = ?").get("feature-agent@example.com");
-  db.prepare("UPDATE tickets SET priority = 'Urgent', assigned_to = ?, created_at = datetime('now', '-3 days') WHERE id = ?").run(
-    agentRow.id,
-    ticketId
-  );
+  const agentRow = await db.prepare("SELECT id FROM agents WHERE email = ?").get("feature-agent@example.com");
+  await db
+    .prepare(
+      "UPDATE tickets SET priority = 'Urgent', assigned_to = ?, created_at = to_char((now() AT TIME ZONE 'UTC') - INTERVAL '3 days', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?"
+    )
+    .run(agentRow.id, ticketId);
 
-  const firstRun = checkSlaBreaches();
+  const firstRun = await checkSlaBreaches();
   assert.ok(firstRun >= 1);
-  let ticket = db.prepare("SELECT sla_alerted_at FROM tickets WHERE id = ?").get(ticketId);
+  let ticket = await db.prepare("SELECT sla_alerted_at FROM tickets WHERE id = ?").get(ticketId);
   assert.ok(ticket.sla_alerted_at);
 
   // Doesn't alert again on a second pass for the same still-open breach.
-  db.prepare("UPDATE tickets SET sla_alerted_at = 'sentinel' WHERE id = ?").run(ticketId);
-  checkSlaBreaches();
-  ticket = db.prepare("SELECT sla_alerted_at FROM tickets WHERE id = ?").get(ticketId);
+  await db.prepare("UPDATE tickets SET sla_alerted_at = 'sentinel' WHERE id = ?").run(ticketId);
+  await checkSlaBreaches();
+  ticket = await db.prepare("SELECT sla_alerted_at FROM tickets WHERE id = ?").get(ticketId);
   assert.equal(ticket.sla_alerted_at, "sentinel");
 
   // Reopening (via the dashboard status route) clears it so a future breach
   // can alert again.
-  db.prepare("UPDATE tickets SET status = 'Resolved' WHERE id = ?").run(ticketId);
+  await db.prepare("UPDATE tickets SET status = 'Resolved' WHERE id = ?").run(ticketId);
   const ticketPage = await client.get(`/dashboard/tickets/${ticketId}`);
   const csrf = extractCsrf(await ticketPage.text());
   await client.postForm(`/dashboard/tickets/${ticketId}/status`, { status: "Open", _csrf: csrf });
-  ticket = db.prepare("SELECT sla_alerted_at FROM tickets WHERE id = ?").get(ticketId);
+  ticket = await db.prepare("SELECT sla_alerted_at FROM tickets WHERE id = ?").get(ticketId);
   assert.equal(ticket.sla_alerted_at, null);
 });
 
@@ -235,15 +228,18 @@ test("image attachments get an inline preview; non-image types refuse one", asyn
   const statusHtml = await statusRes.text();
   assert.match(statusHtml, /attachments\/\d+\/preview\?ticket_id/); // at least one inline preview rendered
 
-  const pngId = db.prepare("SELECT id FROM attachments WHERE ticket_id = ? AND original_name = ?").get(ticketId, "screen.png").id;
-  const txtId = db.prepare("SELECT id FROM attachments WHERE ticket_id = ? AND original_name = ?").get(ticketId, "notes.txt").id;
+  const pngId = (await db.prepare("SELECT id FROM attachments WHERE ticket_id = ? AND original_name = ?").get(ticketId, "screen.png")).id;
+  const txtId = (await db.prepare("SELECT id FROM attachments WHERE ticket_id = ? AND original_name = ?").get(ticketId, "notes.txt")).id;
 
   const previewRes = await client.get(
     `/status/attachments/${pngId}/preview?ticket_id=${ticketId}&requester_email=preview-tester%40example.com`
   );
   assert.equal(previewRes.status, 200);
   assert.equal(previewRes.headers.get("content-type"), "image/png");
-  assert.equal(previewRes.headers.get("content-disposition"), "inline");
+  // Content-Disposition now also carries the original filename (see
+  // src/attachments.js's streamAttachment, added with the Vercel Blob
+  // migration) - "inline" is still the key part under test here.
+  assert.match(previewRes.headers.get("content-disposition"), /^inline/);
 
   const txtPreviewRes = await client.get(
     `/status/attachments/${txtId}/preview?ticket_id=${ticketId}&requester_email=preview-tester%40example.com`
@@ -272,26 +268,29 @@ test("GDPR export bundles a requester's tickets; erasure redacts identity, free 
   assert.equal(bundle.requester_email, "privacy-person@example.com");
   assert.equal(bundle.tickets[0].ticket.subject, "Personal request");
 
-  const attachmentRow = db.prepare("SELECT stored_name FROM attachments WHERE ticket_id = ?").get(ticketId);
-  const fs = require("fs");
-  const path = require("path");
-  const storedPath = path.join(path.dirname(app.dbPath), "attachments", attachmentRow.stored_name);
-  assert.ok(fs.existsSync(storedPath));
+  // Attachments live in Vercel Blob (private access - see src/attachments.js),
+  // not local disk - existence is checked with blob.head(), which throws
+  // BlobNotFoundError once the blob is actually gone.
+  const { head: headBlob } = require("@vercel/blob");
+  const attachmentRow = await db.prepare("SELECT stored_name FROM attachments WHERE ticket_id = ?").get(ticketId);
+  const beforeHead = await headBlob(attachmentRow.stored_name);
+  assert.ok(beforeHead);
 
   const eraseRes = await client.postForm(`/dashboard/tickets/${ticketId}/privacy/erase`, { _csrf: csrf });
   assert.equal(eraseRes.status, 302);
 
-  const erased = db.prepare("SELECT * FROM tickets WHERE id = ?").get(ticketId);
+  const erased = await db.prepare("SELECT * FROM tickets WHERE id = ?").get(ticketId);
   assert.equal(erased.requester_name, "[erased]");
   assert.notEqual(erased.requester_email, "privacy-person@example.com");
   assert.match(erased.description, /erased/);
   assert.ok(erased.data_erased_at);
 
-  const activity = db.prepare("SELECT body FROM ticket_activity WHERE ticket_id = ? AND type = 'note'").all(ticketId);
+  const activity = await db.prepare("SELECT body FROM ticket_activity WHERE ticket_id = ? AND type = 'note'").all(ticketId);
   assert.ok(activity.every((a) => /erased/.test(a.body)));
 
-  assert.equal(fs.existsSync(storedPath), false);
-  assert.equal(db.prepare("SELECT COUNT(*) c FROM attachments WHERE ticket_id = ?").get(ticketId).c, 0);
+  await assert.rejects(() => headBlob(attachmentRow.stored_name), /BlobNotFoundError|does not exist/);
+  const remainingAttachments = await db.prepare("SELECT COUNT(*) c FROM attachments WHERE ticket_id = ?").get(ticketId);
+  assert.equal(remainingAttachments.c, 0);
 });
 
 test("Portuguese language toggle translates the public request form", async () => {

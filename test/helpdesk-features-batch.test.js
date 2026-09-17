@@ -5,7 +5,6 @@
 // in-app notification bell.
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -14,35 +13,30 @@ let app, client, db, agentId;
 before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
-  db = new DatabaseSync(app.dbPath);
+  db = app.db;
 
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Batch Agent",
-    "batch-agent@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
-  agentId = db.prepare("SELECT id FROM agents WHERE email = 'batch-agent@example.com'").get().id;
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Batch Agent", "batch-agent@example.com", bcrypt.hashSync("correct-password", 4));
+  agentId = (await db.prepare("SELECT id FROM agents WHERE email = 'batch-agent@example.com'").get()).id;
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
   await client.postForm("/login", { email: "batch-agent@example.com", password: "correct-password", _csrf: csrf });
 });
 
-after(() => {
-  db.close();
-  return app.close();
-});
+after(() => app.close());
 
 // The public form is rate-limited (10 per 15 minutes) - most of these tests
 // don't need to exercise that route specifically, so they insert a ticket
 // directly instead, keeping the handful of submitTicket() calls that
 // genuinely need the real creation flow (subcategory capture, automation
 // rules) safely under the limit.
-function insertTicket(fields = {}) {
-  const result = db
+async function insertTicket(fields = {}) {
+  const result = await db
     .prepare(
       `INSERT INTO tickets (subject, description, category, requester_name, requester_email, assigned_to, priority, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`
+       VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, now_text()))`
     )
     .run(
       fields.subject || "Default subject",
@@ -71,8 +65,8 @@ async function submitTicket(fields) {
 }
 
 test("bulk tag: adding and removing a tag across every selected ticket", async () => {
-  const id1 = insertTicket({ subject: "Widget conveyor jam" });
-  const id2 = insertTicket({ subject: "Thermostat calibration error" });
+  const id1 = await insertTicket({ subject: "Widget conveyor jam" });
+  const id2 = await insertTicket({ subject: "Thermostat calibration error" });
 
   const home = await client.get("/dashboard");
   const csrf = extractCsrf(await home.text());
@@ -87,14 +81,16 @@ test("bulk tag: adding and removing a tag across every selected ticket", async (
   // the tag name also appears in the page's "existing tags" datalist
   // regardless of whether it's applied to this particular ticket (tags stay
   // in the shared catalog for reuse even when unlinked - see src/tags.js).
-  const appliedCount = () =>
-    db
-      .prepare(
-        `SELECT COUNT(*) AS c FROM ticket_tags JOIN tags ON tags.id = ticket_tags.tag_id
-         WHERE tags.name = 'batch-tagged' AND ticket_tags.ticket_id IN (?, ?)`
-      )
-      .get(id1, id2).c;
-  assert.equal(appliedCount(), 2);
+  const appliedCount = async () =>
+    (
+      await db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM ticket_tags JOIN tags ON tags.id = ticket_tags.tag_id
+           WHERE tags.name = 'batch-tagged' AND ticket_tags.ticket_id IN (?, ?)`
+        )
+        .get(id1, id2)
+    ).c;
+  assert.equal(await appliedCount(), 2);
 
   await client.postForm("/dashboard/bulk/tag", {
     ticket_ids: [id1, id2],
@@ -102,7 +98,7 @@ test("bulk tag: adding and removing a tag across every selected ticket", async (
     tag_action: "remove",
     _csrf: csrf,
   });
-  assert.equal(appliedCount(), 0);
+  assert.equal(await appliedCount(), 0);
 });
 
 test("manual ticket linking is symmetric and unlinkable", async () => {
@@ -112,8 +108,8 @@ test("manual ticket linking is symmetric and unlinkable", async () => {
   // different requester emails (so the unrelated "other tickets from this
   // requester" card doesn't also surface one ticket's subject on the other's
   // page regardless of linking).
-  const id1 = insertTicket({ subject: "Fluorescent bulb flickering upstairs", requester_email: "link-req-1@example.com" });
-  const id2 = insertTicket({ subject: "Elevator keypad unresponsive", requester_email: "link-req-2@example.com" });
+  const id1 = await insertTicket({ subject: "Fluorescent bulb flickering upstairs", requester_email: "link-req-1@example.com" });
+  const id2 = await insertTicket({ subject: "Elevator keypad unresponsive", requester_email: "link-req-2@example.com" });
 
   const page = await client.get(`/dashboard/tickets/${id1}`);
   const csrf = extractCsrf(await page.text());
@@ -135,13 +131,13 @@ test("manual ticket linking is symmetric and unlinkable", async () => {
 });
 
 test("Waiting on Customer pauses the aging clock, and resuming folds the paused time into paused_hours", async () => {
-  const id = insertTicket({ subject: "Waiting on customer flow" });
+  const id = await insertTicket({ subject: "Waiting on customer flow" });
 
   const page = await client.get(`/dashboard/tickets/${id}`);
   const csrf = extractCsrf(await page.text());
   await client.postForm(`/dashboard/tickets/${id}/status`, { status: "Waiting on Customer", _csrf: csrf });
 
-  let row = db.prepare("SELECT status, waiting_since, paused_hours FROM tickets WHERE id = ?").get(id);
+  let row = await db.prepare("SELECT status, waiting_since, paused_hours FROM tickets WHERE id = ?").get(id);
   assert.equal(row.status, "Waiting on Customer");
   assert.ok(row.waiting_since);
   assert.equal(row.paused_hours, 0);
@@ -149,13 +145,17 @@ test("Waiting on Customer pauses the aging clock, and resuming folds the paused 
   // Backdate waiting_since by a full week (not a couple of hours) so
   // leaving the status always has real elapsed business hours to fold in,
   // regardless of what day/time this suite happens to run.
-  db.prepare("UPDATE tickets SET waiting_since = datetime('now', '-7 days') WHERE id = ?").run(id);
+  await db
+    .prepare(
+      "UPDATE tickets SET waiting_since = to_char((now() AT TIME ZONE 'UTC') - INTERVAL '7 days', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?"
+    )
+    .run(id);
 
   const page2 = await client.get(`/dashboard/tickets/${id}`);
   const csrf2 = extractCsrf(await page2.text());
   await client.postForm(`/dashboard/tickets/${id}/status`, { status: "In Progress", _csrf: csrf2 });
 
-  row = db.prepare("SELECT status, waiting_since, paused_hours FROM tickets WHERE id = ?").get(id);
+  row = await db.prepare("SELECT status, waiting_since, paused_hours FROM tickets WHERE id = ?").get(id);
   assert.equal(row.status, "In Progress");
   assert.equal(row.waiting_since, null);
   assert.ok(row.paused_hours > 0, "expected some paused business hours to have been folded in");
@@ -165,29 +165,33 @@ test("subcategory is captured on the public form and shown on the ticket", async
   const id = await submitTicket({ subject: "Printer jam", subcategory: "Printer" });
   const html = await (await client.get(`/dashboard/tickets/${id}`)).text();
   assert.match(html, /Hardware.*Printer|Printer.*Hardware/s);
-  const row = db.prepare("SELECT subcategory FROM tickets WHERE id = ?").get(id);
+  const row = await db.prepare("SELECT subcategory FROM tickets WHERE id = ?").get(id);
   assert.equal(row.subcategory, "Printer");
 });
 
-test("first-response SLA breach emails the assignee once and is skipped after any agent activity", () => {
+test("first-response SLA breach emails the assignee once and is skipped after any agent activity", async () => {
   const { checkFirstResponseBreaches } = require("../src/sla");
 
   // 30 days back, not a couple of hours - guarantees well over Urgent's
   // 1-hour default threshold's worth of business hours regardless of what
   // day/time this suite happens to run (see the aging.js tests for the
   // same "avoid wall-clock-dependent flakiness" reasoning).
-  const id = insertTicket({ subject: "Needs a first response", priority: "Urgent" });
-  db.prepare("UPDATE tickets SET created_at = datetime('now', '-30 days') WHERE id = ?").run(id);
+  const id = await insertTicket({ subject: "Needs a first response", priority: "Urgent" });
+  await db
+    .prepare(
+      "UPDATE tickets SET created_at = to_char((now() AT TIME ZONE 'UTC') - INTERVAL '30 days', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?"
+    )
+    .run(id);
 
-  const firstRun = checkFirstResponseBreaches();
+  const firstRun = await checkFirstResponseBreaches();
   assert.ok(firstRun >= 1);
-  const afterFirst = db.prepare("SELECT first_response_alerted_at FROM tickets WHERE id = ?").get(id);
+  const afterFirst = await db.prepare("SELECT first_response_alerted_at FROM tickets WHERE id = ?").get(id);
   assert.ok(afterFirst.first_response_alerted_at);
 
   // Doesn't alert twice for the same still-unanswered ticket.
-  checkFirstResponseBreaches();
-  const stillOneAlert = db.prepare("SELECT first_response_alerted_at FROM tickets WHERE id = ?").get(id).first_response_alerted_at;
-  assert.equal(stillOneAlert, afterFirst.first_response_alerted_at);
+  await checkFirstResponseBreaches();
+  const stillOneAlertRow = await db.prepare("SELECT first_response_alerted_at FROM tickets WHERE id = ?").get(id);
+  assert.equal(stillOneAlertRow.first_response_alerted_at, afterFirst.first_response_alerted_at);
 });
 
 test("recurring tickets: a due template creates a ticket and advances its next run", async () => {
@@ -205,16 +209,18 @@ test("recurring tickets: a due template creates a ticket and advances its next r
     _csrf: csrf,
   });
 
-  const template = db.prepare("SELECT * FROM recurring_tickets WHERE name = 'Weekly check'").get();
+  const template = await db.prepare("SELECT * FROM recurring_tickets WHERE name = 'Weekly check'").get();
   // Force it due right now, rather than waiting on the real clock.
-  db.prepare("UPDATE recurring_tickets SET next_run_at = datetime('now', '-1 minute') WHERE id = ?").run(template.id);
+  await db
+    .prepare("UPDATE recurring_tickets SET next_run_at = to_char((now() AT TIME ZONE 'UTC') - INTERVAL '1 minute', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?")
+    .run(template.id);
 
-  const created = runDueRecurringTickets();
+  const created = await runDueRecurringTickets();
   assert.ok(created >= 1);
-  const newTicket = db.prepare("SELECT * FROM tickets WHERE subject = 'Weekly server check'").get();
+  const newTicket = await db.prepare("SELECT * FROM tickets WHERE subject = 'Weekly server check'").get();
   assert.ok(newTicket);
 
-  const afterRun = db.prepare("SELECT next_run_at FROM recurring_tickets WHERE id = ?").get(template.id);
+  const afterRun = await db.prepare("SELECT next_run_at FROM recurring_tickets WHERE id = ?").get(template.id);
   assert.ok(new Date(afterRun.next_run_at.replace(" ", "T") + "Z") > new Date());
 });
 
@@ -231,14 +237,14 @@ test("automation rule tags and reprioritizes a matching new ticket from the publ
   });
 
   const matchId = await submitTicket({ category: "Network", subject: "Full network outage" });
-  const matchTicket = db.prepare("SELECT priority FROM tickets WHERE id = ?").get(matchId);
+  const matchTicket = await db.prepare("SELECT priority FROM tickets WHERE id = ?").get(matchId);
   assert.equal(matchTicket.priority, "Urgent");
   const matchHtml = await (await client.get(`/dashboard/tickets/${matchId}`)).text();
   assert.match(matchHtml, /escalated/);
 
   // A ticket that doesn't match the keyword shouldn't be touched.
   const missId = await submitTicket({ category: "Network", subject: "Slow wifi in the office" });
-  const missTicket = db.prepare("SELECT priority FROM tickets WHERE id = ?").get(missId);
+  const missTicket = await db.prepare("SELECT priority FROM tickets WHERE id = ?").get(missId);
   assert.equal(missTicket.priority, "Medium");
 });
 
@@ -262,11 +268,11 @@ test("KB auto-suggest returns matching published articles, and nothing for a sho
 });
 
 test("reports page shows the new CSAT trend, agent performance, and reopen-rate sections without erroring", async () => {
-  const id = insertTicket({ subject: "Reports coverage ticket" });
+  const id = await insertTicket({ subject: "Reports coverage ticket" });
   const page = await client.get(`/dashboard/tickets/${id}`);
   const csrf = extractCsrf(await page.text());
   await client.postForm(`/dashboard/tickets/${id}/status`, { status: "Resolved", _csrf: csrf });
-  const ticket = db.prepare("SELECT rating_token FROM tickets WHERE id = ?").get(id);
+  const ticket = await db.prepare("SELECT rating_token FROM tickets WHERE id = ?").get(id);
   const ratePage = await client.get(`/rate/${ticket.rating_token}`);
   const rateCsrf = extractCsrf(await ratePage.text());
   await client.postForm(`/rate/${ticket.rating_token}`, { rating: "5", comment: "Great!", _csrf: rateCsrf });
@@ -286,20 +292,18 @@ test("reports page shows the new CSAT trend, agent performance, and reopen-rate 
 });
 
 test("a mention creates an in-app notification, and opening the bell marks it read", async () => {
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Notify Target",
-    "notify-target@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
-  const target = db.prepare("SELECT id FROM agents WHERE email = 'notify-target@example.com'").get();
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Notify Target", "notify-target@example.com", bcrypt.hashSync("correct-password", 4));
+  const target = await db.prepare("SELECT id FROM agents WHERE email = 'notify-target@example.com'").get();
 
-  const id = insertTicket({ subject: "Mention notification test" });
+  const id = await insertTicket({ subject: "Mention notification test" });
   const page = await client.get(`/dashboard/tickets/${id}`);
   const csrf = extractCsrf(await page.text());
   await client.postForm(`/dashboard/tickets/${id}/note`, { body: "Hey @notifytarget, please check this.", _csrf: csrf });
 
-  const unread = db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE agent_id = ? AND read_at IS NULL").get(target.id).c;
-  assert.equal(unread, 1);
+  const unreadRow = await db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE agent_id = ? AND read_at IS NULL").get(target.id);
+  assert.equal(unreadRow.c, 1);
 
   const targetClient = makeClient(app.baseUrl);
   const tLoginPage = await targetClient.get("/login");
@@ -312,6 +316,6 @@ test("a mention creates an in-app notification, and opening the bell marks it re
 
   const dashCsrf = extractCsrf(dashHtml);
   await targetClient.postForm("/dashboard/notifications/mark-all-read", { _csrf: dashCsrf });
-  const afterMarkRead = db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE agent_id = ? AND read_at IS NULL").get(target.id).c;
-  assert.equal(afterMarkRead, 0);
+  const afterMarkReadRow = await db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE agent_id = ? AND read_at IS NULL").get(target.id);
+  assert.equal(afterMarkReadRow.c, 0);
 });

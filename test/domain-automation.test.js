@@ -15,7 +15,6 @@
 // shape rather than only checking the happy path.
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -29,17 +28,17 @@ async function loginAs(c, email) {
 
 before(async () => {
   app = await startTestApp();
-  db = new DatabaseSync(app.dbPath);
+  db = app.db;
   const passwordHash = bcrypt.hashSync("correct-password", 4);
 
   // IT=1, HR=2, Legal=3, Marketing=4 - seeded in that fixed order by
   // src/db/index.js on a fresh database (see DEFAULT_DEPARTMENTS there),
   // same assumption test/multi-department.test.js already relies on.
   const insertAgent = db.prepare("INSERT INTO agents (name, email, password_hash, department_id) VALUES (?, ?, ?, ?)");
-  insertAgent.run("IT Agent", "it-agent@domain-automation.example.com", passwordHash, 1);
-  insertAgent.run("HR Agent", "hr-agent@domain-automation.example.com", passwordHash, 2);
-  insertAgent.run("Legal Agent", "legal-agent@domain-automation.example.com", passwordHash, 3);
-  insertAgent.run("Marketing Agent", "marketing-agent@domain-automation.example.com", passwordHash, 4);
+  await insertAgent.run("IT Agent", "it-agent@domain-automation.example.com", passwordHash, 1);
+  await insertAgent.run("HR Agent", "hr-agent@domain-automation.example.com", passwordHash, 2);
+  await insertAgent.run("Legal Agent", "legal-agent@domain-automation.example.com", passwordHash, 3);
+  await insertAgent.run("Marketing Agent", "marketing-agent@domain-automation.example.com", passwordHash, 4);
 
   hrClient = makeClient(app.baseUrl);
   itClient = makeClient(app.baseUrl);
@@ -51,10 +50,7 @@ before(async () => {
   await loginAs(marketingClient, "marketing-agent@domain-automation.example.com");
 });
 
-after(() => {
-  db.close();
-  return app.close();
-});
+after(() => app.close());
 
 function isoDaysFromNow(days) {
   return new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -86,12 +82,12 @@ test("contract reminder check emails a ticket's own department once, and a date 
     _csrf: detailCsrf,
   });
 
-  const firstRun = checkContractReminders();
+  const firstRun = await checkContractReminders();
   assert.ok(firstRun >= 1);
-  let ticket = db.prepare("SELECT reminder_alerted_at FROM tickets WHERE id = ?").get(ticketId);
+  let ticket = await db.prepare("SELECT reminder_alerted_at FROM tickets WHERE id = ?").get(ticketId);
   assert.ok(ticket.reminder_alerted_at);
 
-  const secondRun = checkContractReminders();
+  const secondRun = await checkContractReminders();
   assert.equal(secondRun, 0); // already alerted, not re-sent
 
   // Renewing the reminder date clears the alert flag so it can fire again -
@@ -103,7 +99,7 @@ test("contract reminder check emails a ticket's own department once, and a date 
     reminder_date: isoDaysFromNow(400),
     _csrf: editCsrf,
   });
-  ticket = db.prepare("SELECT reminder_alerted_at FROM tickets WHERE id = ?").get(ticketId);
+  ticket = await db.prepare("SELECT reminder_alerted_at FROM tickets WHERE id = ?").get(ticketId);
   assert.equal(ticket.reminder_alerted_at, null);
 });
 
@@ -127,7 +123,7 @@ test("contract reminder field is generic - not restricted to Legal categories at
     _csrf: detailCsrf,
   });
   assert.equal(res.status, 302);
-  const ticket = db.prepare("SELECT reminder_date FROM tickets WHERE id = ?").get(ticketId);
+  const ticket = await db.prepare("SELECT reminder_date FROM tickets WHERE id = ?").get(ticketId);
   assert.ok(ticket.reminder_date);
 });
 
@@ -143,7 +139,7 @@ test("HR onboarding template spawns correctly-departmented IT and Marketing tick
     description: "Full onboarding checklist for the new hire.",
     _csrf: templatesCsrf,
   });
-  const template = db.prepare("SELECT id FROM ticket_templates WHERE name = 'New Hire Onboarding'").get();
+  const template = await db.prepare("SELECT id FROM ticket_templates WHERE name = 'New Hire Onboarding'").get();
 
   async function addItem(label, spawnCategory) {
     const page = await hrClient.get("/dashboard/templates");
@@ -159,7 +155,7 @@ test("HR onboarding template spawns correctly-departmented IT and Marketing tick
   await addItem("Configure PC for {name}", "Hardware"); // spawns an IT ticket
   await addItem("Create profile picture for {name}", "Brand Assets"); // spawns a Marketing ticket
 
-  const items = db.prepare("SELECT * FROM template_checklist_items WHERE template_id = ?").all(template.id);
+  const items = await db.prepare("SELECT * FROM template_checklist_items WHERE template_id = ?").all(template.id);
   assert.equal(items.length, 3);
   assert.equal(items.filter((i) => i.spawn_category).length, 2);
 
@@ -183,14 +179,15 @@ test("HR onboarding template spawns correctly-departmented IT and Marketing tick
 
   // Exactly two tickets were spawned (the plain checklist line spawns
   // nothing), each a real, ordinary ticket in its own department's category.
-  const itTicket = db.prepare("SELECT * FROM tickets WHERE subject = 'Configure PC for Jane Newhire'").get();
-  const marketingTicket = db.prepare("SELECT * FROM tickets WHERE subject = 'Create profile picture for Jane Newhire'").get();
+  const itTicket = await db.prepare("SELECT * FROM tickets WHERE subject = 'Configure PC for Jane Newhire'").get();
+  const marketingTicket = await db.prepare("SELECT * FROM tickets WHERE subject = 'Create profile picture for Jane Newhire'").get();
   assert.ok(itTicket, "IT ticket should have been spawned with the substituted name");
   assert.ok(marketingTicket, "Marketing ticket should have been spawned with the substituted name");
   assert.equal(itTicket.category, "Hardware");
   assert.equal(marketingTicket.category, "Brand Assets");
   assert.equal(itTicket.requester_email, "jane.newhire@example.com");
-  assert.equal(db.prepare("SELECT COUNT(*) AS c FROM tickets WHERE subject LIKE 'Send welcome packet%'").get().c, 0);
+  const welcomeCount = await db.prepare("SELECT COUNT(*) AS c FROM tickets WHERE subject LIKE 'Send welcome packet%'").get();
+  assert.equal(welcomeCount.c, 0);
 
   // Visibility: this is the core assertion. The spawned IT ticket is
   // visible to the IT agent exactly like any other IT ticket...
@@ -222,7 +219,7 @@ test("HR onboarding template spawns correctly-departmented IT and Marketing tick
   // The spawned tickets are linked back to the origin using the app's
   // existing cross-department Link feature (ticket_links), stored
   // symmetrically like every other link.
-  const links = db.prepare("SELECT ticket_id, linked_ticket_id FROM ticket_links WHERE ticket_id = ?").all(hrTicketId);
+  const links = await db.prepare("SELECT ticket_id, linked_ticket_id FROM ticket_links WHERE ticket_id = ?").all(hrTicketId);
   const linkedIds = links.map((l) => l.linked_ticket_id).sort((a, b) => a - b);
   assert.deepEqual(linkedIds.sort((a, b) => a - b), [itTicket.id, marketingTicket.id].sort((a, b) => a - b));
 
@@ -242,8 +239,8 @@ test("template spawns are only applied when the submitted category matches the t
   // A crafted/stale template_id whose own category doesn't match the
   // category actually being filed under must not spawn anything - see the
   // "template.category === category" guard in the /tickets/new POST route.
-  const template = db.prepare("SELECT id FROM ticket_templates WHERE name = 'New Hire Onboarding'").get();
-  const before = db.prepare("SELECT COUNT(*) AS c FROM tickets").get().c;
+  const template = await db.prepare("SELECT id FROM ticket_templates WHERE name = 'New Hire Onboarding'").get();
+  const before = (await db.prepare("SELECT COUNT(*) AS c FROM tickets").get()).c;
 
   const page = await itClient.get("/dashboard/tickets/new");
   const csrf = extractCsrf(await page.text());
@@ -260,6 +257,6 @@ test("template spawns are only applied when the submitted category matches the t
   assert.equal(res.status, 302);
 
   // Exactly one new ticket (the primary one just filed) - no spawns.
-  const after = db.prepare("SELECT COUNT(*) AS c FROM tickets").get().c;
+  const after = (await db.prepare("SELECT COUNT(*) AS c FROM tickets").get()).c;
   assert.equal(after, before + 1);
 });

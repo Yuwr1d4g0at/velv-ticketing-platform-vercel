@@ -1,6 +1,5 @@
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { DatabaseSync } = require("node:sqlite");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
@@ -10,13 +9,9 @@ before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
 
-  const db = new DatabaseSync(app.dbPath);
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    "Workflow Agent",
-    "workflow-agent@example.com",
-    bcrypt.hashSync("correct-password", 4)
-  );
-  db.close();
+  await app.db
+    .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
+    .run("Workflow Agent", "workflow-agent@example.com", bcrypt.hashSync("correct-password", 4));
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
@@ -38,10 +33,8 @@ async function createTicket(subject, email) {
 
 test("new tickets are auto-assigned to the active agent (round-robin)", async () => {
   const ticketId = await createTicket("Round robin test");
-  const db = new DatabaseSync(app.dbPath);
-  const ticket = db.prepare("SELECT assigned_to FROM tickets WHERE id = ?").get(Number(ticketId));
-  const agent = db.prepare("SELECT id FROM agents WHERE email = 'workflow-agent@example.com'").get();
-  db.close();
+  const ticket = await app.db.prepare("SELECT assigned_to FROM tickets WHERE id = ?").get(Number(ticketId));
+  const agent = await app.db.prepare("SELECT id FROM agents WHERE email = 'workflow-agent@example.com'").get();
   assert.equal(ticket.assigned_to, agent.id);
 });
 
@@ -121,9 +114,7 @@ test("an agent's attachment on an internal note is not visible or downloadable v
   const statusHtml = await statusRes.text();
   assert.doesNotMatch(statusHtml, /internal-log\.txt/);
 
-  const db = new DatabaseSync(app.dbPath);
-  const row = db.prepare("SELECT id FROM attachments WHERE original_name = 'internal-log.txt'").get();
-  db.close();
+  const row = await app.db.prepare("SELECT id FROM attachments WHERE original_name = 'internal-log.txt'").get();
   const downloadRes = await client.postForm(`/status/attachments/${row.id}/download`, {
     ticket_id: ticketId,
     requester_email: "internal-attach@example.com",
@@ -145,9 +136,7 @@ test("bulk status change and bulk assignment apply to every selected ticket", as
   });
   assert.equal(bulkStatusRes.status, 302);
 
-  const db = new DatabaseSync(app.dbPath);
-  const rows = db.prepare("SELECT id, status FROM tickets WHERE id IN (?, ?)").all(Number(id1), Number(id2));
-  db.close();
+  const rows = await app.db.prepare("SELECT id, status FROM tickets WHERE id IN (?, ?)").all(Number(id1), Number(id2));
   assert.ok(rows.every((r) => r.status === "In Progress"), "expected both tickets to move to In Progress");
 });
 
@@ -164,9 +153,11 @@ test("dashboard shows a requester's other tickets on the ticket detail page", as
 test("dashboard shows an average resolution time once a ticket has been resolved", async () => {
   const id = await createTicket("Resolution time test", "resolution-requester@example.com");
 
-  const db = new DatabaseSync(app.dbPath);
-  db.prepare("UPDATE tickets SET created_at = datetime('now', '-3 days') WHERE id = ?").run(Number(id));
-  db.close();
+  await app.db
+    .prepare(
+      "UPDATE tickets SET created_at = to_char((now() AT TIME ZONE 'UTC') - INTERVAL '3 days', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?"
+    )
+    .run(Number(id));
 
   const ticketPage = await client.get(`/dashboard/tickets/${id}`);
   const csrf = extractCsrf(await ticketPage.text());
@@ -195,11 +186,13 @@ test("aging threshold depends on priority", async () => {
   const freshRes = await client.get(`/dashboard/tickets/${id}`);
   assert.doesNotMatch(await freshRes.text(), /badge-aging/);
 
-  const db = new DatabaseSync(app.dbPath);
   // Unambiguously past every priority's threshold (even Low's 7 days),
   // regardless of weekday alignment - not trying to hit an exact boundary.
-  db.prepare("UPDATE tickets SET created_at = datetime('now', '-30 days') WHERE id = ?").run(Number(id));
-  db.close();
+  await app.db
+    .prepare(
+      "UPDATE tickets SET created_at = to_char((now() AT TIME ZONE 'UTC') - INTERVAL '30 days', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?"
+    )
+    .run(Number(id));
 
   const res = await client.get(`/dashboard/tickets/${id}`);
   const html = await res.text();
