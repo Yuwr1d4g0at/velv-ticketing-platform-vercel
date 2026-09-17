@@ -21,33 +21,32 @@ function today() {
 // without the hour check this would fire on every periodic check until the
 // date rolls over; without the once-per-day check it'd fire on every check
 // *within* that hour too.
-function sendDueDigests() {
+async function sendDueDigests() {
   if (new Date().getHours() !== DIGEST_HOUR) return 0;
 
-  const agents = db
+  const agents = await db
     .prepare(
       `SELECT id, name, email FROM agents
-       WHERE active = 1 AND (last_digest_at IS NULL OR date(last_digest_at) != date('now'))`
+       WHERE active = 1 AND (last_digest_at IS NULL OR last_digest_at::date != CURRENT_DATE)`
     )
     .all();
 
   let sent = 0;
   for (const agent of agents) {
-    const tickets = annotateAging(
-      db
-        .prepare(
-          `SELECT id, subject, priority, status, created_at, waiting_since, paused_hours FROM tickets
-           WHERE assigned_to = ? AND status IN ('Open', 'In Progress')
-           ORDER BY CASE priority WHEN 'Urgent' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END, created_at ASC
-           LIMIT 20`
-        )
-        .all(agent.id)
-    );
+    const rows = await db
+      .prepare(
+        `SELECT id, subject, priority, status, created_at, waiting_since, paused_hours FROM tickets
+         WHERE assigned_to = ? AND status IN ('Open', 'In Progress')
+         ORDER BY CASE priority WHEN 'Urgent' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END, created_at ASC
+         LIMIT 20`
+      )
+      .all(agent.id);
+    const tickets = await annotateAging(rows);
 
     // Marked as sent regardless of whether there was anything to report -
     // an empty queue is still worth knowing "nothing's outstanding", and
     // either way it stops this agent being re-checked again today.
-    db.prepare("UPDATE agents SET last_digest_at = datetime('now') WHERE id = ?").run(agent.id);
+    await db.prepare("UPDATE agents SET last_digest_at = now_text() WHERE id = ?").run(agent.id);
     if (!tickets.length) continue;
 
     sendDailyDigest({

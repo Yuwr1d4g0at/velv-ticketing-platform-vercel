@@ -51,6 +51,21 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 // Reproduces SQLite's `datetime('now')` exactly: "YYYY-MM-DD HH:MM:SS", UTC.
 const NOW_TEXT = `to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')`;
 
+// A real Postgres function so every INLINE `datetime('now')` call in
+// application SQL (UPDATE ... SET updated_at = datetime('now'), etc. -
+// dozens of call sites across src/, not just column DEFAULTs) can become a
+// short, drop-in `now_text()` instead of repeating the to_char(...)
+// expression above everywhere or hand-computing a JS timestamp string at
+// every call site. Table DEFAULTs below still use NOW_TEXT directly rather
+// than calling this function, purely so the schema reads standalone without
+// a forward reference to a function defined later in the same script -
+// same underlying expression either way.
+const NOW_TEXT_FUNCTION_SQL = `
+  CREATE OR REPLACE FUNCTION now_text() RETURNS TEXT AS $$
+    SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
+  $$ LANGUAGE SQL STABLE;
+`;
+
 const SCHEMA_SQL = `
   -- Dependency order matters here (unlike the old SQLite file, which could
   -- lean on SQLite's laxer forward-reference handling) - Postgres requires a
@@ -406,6 +421,7 @@ async function seedIfEmpty(client, table, countSql, insertFn) {
 async function migrate() {
   const client = await pool.connect();
   try {
+    await client.query(NOW_TEXT_FUNCTION_SQL);
     await client.query(SCHEMA_SQL);
 
     // Same seed-if-empty data as the old src/db/index.js - historical

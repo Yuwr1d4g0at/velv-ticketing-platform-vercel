@@ -23,8 +23,8 @@ const { sendContractReminderDigest } = require("./mailer");
 
 const CONTRACT_REMINDER_ALERT_DAYS = parseInt(process.env.CONTRACT_REMINDER_ALERT_DAYS, 10) || 30;
 
-function checkContractReminders() {
-  const expiringSoon = db
+async function checkContractReminders() {
+  const expiringSoon = await db
     .prepare(
       `SELECT id, subject, category, reminder_date
        FROM tickets
@@ -32,7 +32,7 @@ function checkContractReminders() {
          AND reminder_alerted_at IS NULL
          AND status NOT IN ('Resolved', 'Closed')
          AND merged_into_id IS NULL
-         AND date(reminder_date) <= date('now', '+' || ? || ' days')`
+         AND reminder_date::date <= (CURRENT_DATE + (?::integer * INTERVAL '1 day'))::date`
     )
     .all(CONTRACT_REMINDER_ALERT_DAYS);
 
@@ -44,14 +44,14 @@ function checkContractReminders() {
   // instead of a page.
   const byDepartment = new Map();
   for (const ticket of expiringSoon) {
-    const deptId = departments.departmentIdForCategory(ticket.category);
+    const deptId = await departments.departmentIdForCategory(ticket.category);
     if (deptId == null) continue; // orphaned/renamed category safety net; shouldn't happen
     if (!byDepartment.has(deptId)) byDepartment.set(deptId, []);
     byDepartment.get(deptId).push(ticket);
   }
 
   for (const [deptId, tickets] of byDepartment) {
-    const activeAgents = db.prepare("SELECT email FROM agents WHERE active = 1 AND department_id = ?").all(deptId);
+    const activeAgents = await db.prepare("SELECT email FROM agents WHERE active = 1 AND department_id = ?").all(deptId);
     for (const agent of activeAgents) {
       sendContractReminderDigest({ to: agent.email, tickets }).catch((err) =>
         console.error("Could not send contract reminder digest:", err.message)
@@ -59,8 +59,8 @@ function checkContractReminders() {
     }
   }
 
-  const markAlerted = db.prepare("UPDATE tickets SET reminder_alerted_at = datetime('now') WHERE id = ?");
-  for (const ticket of expiringSoon) markAlerted.run(ticket.id);
+  const markAlerted = db.prepare("UPDATE tickets SET reminder_alerted_at = now_text() WHERE id = ?");
+  for (const ticket of expiringSoon) await markAlerted.run(ticket.id);
 
   return expiringSoon.length;
 }

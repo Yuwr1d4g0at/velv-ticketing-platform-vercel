@@ -1,9 +1,10 @@
+// Ported to the async Postgres adapter (see src/db/index.js).
 const db = require("./db");
 
 const MAX_TITLE_LENGTH = 80;
 const MAX_BODY_LENGTH = 5000;
 
-function all() {
+async function all() {
   return db
     .prepare(
       `SELECT canned_responses.id, canned_responses.title, canned_responses.body, canned_responses.department_id,
@@ -20,7 +21,7 @@ function all() {
 // by the ticket page's "Insert a canned response" picker (see item 7 of the
 // multi-department feature: canned responses stay separate per department,
 // same as KB articles).
-function forAgent(agent) {
+async function forAgent(agent) {
   if (agent && agent.is_admin) return all();
   return db
     .prepare(
@@ -34,17 +35,17 @@ function forAgent(agent) {
     .all(agent && agent.department_id);
 }
 
-function get(id) {
+async function get(id) {
   return db.prepare("SELECT id, title, body, department_id FROM canned_responses WHERE id = ?").get(id);
 }
 
-function create(title, body, departmentId = null) {
+async function create(title, body, departmentId = null) {
   return db
     .prepare("INSERT INTO canned_responses (title, body, department_id) VALUES (?, ?, ?)")
     .run(title.trim().slice(0, MAX_TITLE_LENGTH), body.trim().slice(0, MAX_BODY_LENGTH), departmentId);
 }
 
-function remove(id) {
+async function remove(id) {
   return db.prepare("DELETE FROM canned_responses WHERE id = ?").run(id);
 }
 

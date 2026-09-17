@@ -30,25 +30,29 @@ function requireAdmin(req, res, next) {
 // place that has to keep them current. totp_enabled is here too so the
 // header/settings views can show current 2FA status without a second query.
 function attachAgent(db) {
-  return (req, res, next) => {
-    if (req.session && req.session.agentId) {
-      const agent = db
-        .prepare(
-          `SELECT agents.id, agents.name, agents.email, agents.department_id, agents.is_admin,
-                  agents.totp_enabled, departments.name AS department_name
-           FROM agents
-           LEFT JOIN departments ON departments.id = agents.department_id
-           WHERE agents.id = ? AND agents.active = 1`
-        )
-        .get(req.session.agentId);
-      res.locals.currentAgent = agent || null;
-      if (!agent) {
-        req.session.agentId = null;
+  return async (req, res, next) => {
+    try {
+      if (req.session && req.session.agentId) {
+        const agent = await db
+          .prepare(
+            `SELECT agents.id, agents.name, agents.email, agents.department_id, agents.is_admin,
+                    agents.totp_enabled, departments.name AS department_name
+             FROM agents
+             LEFT JOIN departments ON departments.id = agents.department_id
+             WHERE agents.id = ? AND agents.active = 1`
+          )
+          .get(req.session.agentId);
+        res.locals.currentAgent = agent || null;
+        if (!agent) {
+          req.session.agentId = null;
+        }
+      } else {
+        res.locals.currentAgent = null;
       }
-    } else {
-      res.locals.currentAgent = null;
+      next();
+    } catch (err) {
+      next(err);
     }
-    next();
   };
 }
 

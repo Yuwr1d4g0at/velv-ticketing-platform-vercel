@@ -11,7 +11,7 @@
 // themselves.
 //
 // This can no longer be expressed as a single SQL predicate (there's no
-// reasonable way to do business-hours arithmetic in plain SQLite), so
+// reasonable way to do business-hours arithmetic in plain SQL), so
 // consumers fetch candidate rows in SQL (open/in-progress, etc.) and filter
 // or annotate them with isAgingTicket() in JS instead of a WHERE clause.
 //
@@ -19,6 +19,14 @@
 // /dashboard/settings), not a hardcoded constant - read fresh on every call
 // rather than cached, since a settings change should take effect
 // immediately without a restart.
+//
+// Ported to the async Postgres adapter (see src/db/index.js). One real
+// shape change beyond plain async/await: isAgingTicket's `thresholds`
+// parameter used to default to `currentThresholds()` (a function call
+// inline in the parameter list) - that doesn't work once currentThresholds
+// is async (a default expression can't await), so the default was moved
+// into the function body instead (`if (thresholds === undefined) thresholds
+// = await currentThresholds();`), same effective behavior.
 const db = require("./db");
 const { holidaySet } = require("./holidays");
 
@@ -27,8 +35,8 @@ const BUSINESS_HOURS_START = 9; // 09:00
 const BUSINESS_HOURS_END = 18; // 18:00
 const BUSINESS_HOURS_PER_DAY = BUSINESS_HOURS_END - BUSINESS_HOURS_START;
 
-function currentThresholds() {
-  const rows = db.prepare("SELECT priority, days FROM sla_thresholds").all();
+async function currentThresholds() {
+  const rows = await db.prepare("SELECT priority, days FROM sla_thresholds").all();
   return Object.fromEntries(rows.map((r) => [r.priority, r.days]));
 }
 
@@ -36,8 +44,8 @@ function currentThresholds() {
 // time-to-first-response target (see first_response_thresholds in
 // src/db/index.js) - a distinct, usually much tighter, expectation from
 // overall resolution.
-function currentFirstResponseThresholds() {
-  const rows = db.prepare("SELECT priority, hours FROM first_response_thresholds").all();
+async function currentFirstResponseThresholds() {
+  const rows = await db.prepare("SELECT priority, hours FROM first_response_thresholds").all();
   return Object.fromEntries(rows.map((r) => [r.priority, r.hours]));
 }
 
@@ -74,12 +82,12 @@ function businessHoursOnDay(day, rangeStart, rangeEnd, holidays) {
   return end > start ? (end - start) / (1000 * 60 * 60) : 0;
 }
 
-function businessHoursElapsed(startDate, endDate) {
+async function businessHoursElapsed(startDate, endDate) {
   if (endDate <= startDate) return 0;
   // Fetched once per call (not once per day inside the loop below) - still
   // always a fresh read, so an edit to the holiday list takes effect on the
   // very next calculation, without needing a caching/invalidation scheme.
-  const holidays = holidaySet();
+  const holidays = await holidaySet();
   let total = 0;
   const cursor = new Date(startDate);
   cursor.setHours(0, 0, 0, 0);
@@ -96,31 +104,33 @@ function businessHoursElapsed(startDate, endDate) {
 // dashboard.js), and, if it's *currently* waiting, the hours since
 // waiting_since - so time spent waiting on the requester never counts
 // against the team's own aging clock.
-function agingHoursElapsed(ticket, now = new Date()) {
+async function agingHoursElapsed(ticket, now = new Date()) {
   const created = new Date(`${ticket.created_at.replace(" ", "T")}Z`);
-  let elapsed = businessHoursElapsed(created, now) - (ticket.paused_hours || 0);
+  let elapsed = (await businessHoursElapsed(created, now)) - (ticket.paused_hours || 0);
   if (ticket.status === "Waiting on Customer" && ticket.waiting_since) {
     const waitingSince = new Date(`${ticket.waiting_since.replace(" ", "T")}Z`);
-    elapsed -= businessHoursElapsed(waitingSince, now);
+    elapsed -= await businessHoursElapsed(waitingSince, now);
   }
   return Math.max(0, elapsed);
 }
 
-// `now` defaults to the real clock in production use; tests pass a fixed
-// Date instead so a boundary case (crossing one priority's threshold but
-// not another's) is exact and deterministic rather than depending on which
-// weekday the test suite happens to run on.
-function isAgingTicket(ticket, thresholds = currentThresholds(), now = new Date()) {
+// `thresholds` defaults to a fresh currentThresholds() read when omitted;
+// `now` defaults to the real clock in production use, but tests pass a
+// fixed Date instead so a boundary case (crossing one priority's threshold
+// but not another's) is exact and deterministic rather than depending on
+// which weekday the test suite happens to run on.
+async function isAgingTicket(ticket, thresholds, now = new Date()) {
+  if (thresholds === undefined) thresholds = await currentThresholds();
   if (!["Open", "In Progress"].includes(ticket.status)) return false;
   const thresholdDays = thresholds[ticket.priority] ?? FALLBACK_DAYS;
-  return agingHoursElapsed(ticket, now) > thresholdDays * BUSINESS_HOURS_PER_DAY;
+  return (await agingHoursElapsed(ticket, now)) > thresholdDays * BUSINESS_HOURS_PER_DAY;
 }
 
 // Annotates a batch of already-fetched ticket rows with is_aging, reading
 // thresholds once for the whole batch rather than once per row.
-function annotateAging(tickets) {
-  const thresholds = currentThresholds();
-  return tickets.map((t) => ({ ...t, is_aging: isAgingTicket(t, thresholds) }));
+async function annotateAging(tickets) {
+  const thresholds = await currentThresholds();
+  return Promise.all(tickets.map(async (t) => ({ ...t, is_aging: await isAgingTicket(t, thresholds) })));
 }
 
 module.exports = {

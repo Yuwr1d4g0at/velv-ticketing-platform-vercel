@@ -12,13 +12,11 @@ function mentionTag(name) {
 // Every @word in the body, matched (exact tag match, not prefix) against
 // every active agent's derived tag - excluding the author themselves,
 // there's no point emailing someone their own note.
-function findMentionedAgents(body, authorAgentId) {
+async function findMentionedAgents(body, authorAgentId) {
   const tokens = new Set((body.match(/@([a-z0-9]+)/gi) || []).map((m) => m.slice(1).toLowerCase()));
   if (!tokens.size) return [];
-  return db
-    .prepare("SELECT id, name, email FROM agents WHERE active = 1 AND id != ?")
-    .all(authorAgentId || -1)
-    .filter((agent) => tokens.has(mentionTag(agent.name)));
+  const agents = await db.prepare("SELECT id, name, email FROM agents WHERE active = 1 AND id != ?").all(authorAgentId || -1);
+  return agents.filter((agent) => tokens.has(mentionTag(agent.name)));
 }
 
 module.exports = { mentionTag, findMentionedAgents };

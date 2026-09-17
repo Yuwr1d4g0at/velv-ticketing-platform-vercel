@@ -5,6 +5,12 @@
 // outage, missing permissions, or SSO not being configured at all all just
 // mean "show no enrichment, fall back to whatever's cached" - never a
 // broken page.
+//
+// Ported to the async Postgres adapter (see src/db/index.js). Inline
+// `datetime('now')` calls became `now_text()`. photo_blob is BYTEA in
+// Postgres (was BLOB in SQLite) - the driver already hands back a Buffer
+// for it and accepts a Buffer as a bound parameter natively, so no change
+// needed there beyond async/await.
 const db = require("./db");
 const msGraph = require("./msGraph");
 
@@ -26,7 +32,7 @@ function profileFromRow(row) {
 async function getProfile(email) {
   if (!email) return null;
   const normalized = email.trim().toLowerCase();
-  const cached = db.prepare("SELECT * FROM directory_cache WHERE email = ?").get(normalized);
+  const cached = await db.prepare("SELECT * FROM directory_cache WHERE email = ?").get(normalized);
 
   if (cached && !isStale(cached.fetched_at)) return profileFromRow(cached);
   if (!msGraph.isEnabled()) return profileFromRow(cached);
@@ -39,21 +45,23 @@ async function getProfile(email) {
     return profileFromRow(cached); // stale-but-real beats nothing
   }
 
-  db.prepare(
-    `INSERT INTO directory_cache (email, display_name, department, job_title, phone, found, fetched_at)
-     VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-     ON CONFLICT(email) DO UPDATE SET
-       display_name = excluded.display_name, department = excluded.department,
-       job_title = excluded.job_title, phone = excluded.phone,
-       found = excluded.found, fetched_at = excluded.fetched_at`
-  ).run(
-    normalized,
-    profile ? profile.displayName : null,
-    profile ? profile.department : null,
-    profile ? profile.jobTitle : null,
-    profile ? profile.phone : null,
-    profile ? 1 : 0
-  );
+  await db
+    .prepare(
+      `INSERT INTO directory_cache (email, display_name, department, job_title, phone, found, fetched_at)
+       VALUES (?, ?, ?, ?, ?, ?, now_text())
+       ON CONFLICT(email) DO UPDATE SET
+         display_name = excluded.display_name, department = excluded.department,
+         job_title = excluded.job_title, phone = excluded.phone,
+         found = excluded.found, fetched_at = excluded.fetched_at`
+    )
+    .run(
+      normalized,
+      profile ? profile.displayName : null,
+      profile ? profile.department : null,
+      profile ? profile.jobTitle : null,
+      profile ? profile.phone : null,
+      profile ? 1 : 0
+    );
 
   return profile;
 }
@@ -64,7 +72,7 @@ async function getProfile(email) {
 async function getPhoto(email) {
   if (!email) return null;
   const normalized = email.trim().toLowerCase();
-  const cached = db.prepare("SELECT photo_blob, photo_content_type, fetched_at FROM directory_cache WHERE email = ?").get(normalized);
+  const cached = await db.prepare("SELECT photo_blob, photo_content_type, fetched_at FROM directory_cache WHERE email = ?").get(normalized);
   const cachedPhoto = cached && cached.photo_blob ? { buffer: Buffer.from(cached.photo_blob), contentType: cached.photo_content_type } : null;
 
   if (cached && cachedPhoto && !isStale(cached.fetched_at)) return cachedPhoto;
@@ -78,12 +86,14 @@ async function getPhoto(email) {
     return cachedPhoto;
   }
 
-  db.prepare(
-    `INSERT INTO directory_cache (email, photo_blob, photo_content_type, fetched_at)
-     VALUES (?, ?, ?, datetime('now'))
-     ON CONFLICT(email) DO UPDATE SET
-       photo_blob = excluded.photo_blob, photo_content_type = excluded.photo_content_type, fetched_at = excluded.fetched_at`
-  ).run(normalized, photo ? photo.buffer : null, photo ? photo.contentType : null);
+  await db
+    .prepare(
+      `INSERT INTO directory_cache (email, photo_blob, photo_content_type, fetched_at)
+       VALUES (?, ?, ?, now_text())
+       ON CONFLICT(email) DO UPDATE SET
+         photo_blob = excluded.photo_blob, photo_content_type = excluded.photo_content_type, fetched_at = excluded.fetched_at`
+    )
+    .run(normalized, photo ? photo.buffer : null, photo ? photo.contentType : null);
 
   return photo;
 }

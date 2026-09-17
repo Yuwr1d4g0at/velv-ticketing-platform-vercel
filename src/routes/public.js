@@ -87,11 +87,11 @@ const previewLimiter = rateLimit({
 // datalist (e.g. "Printer" typed once under Hardware shows up as a
 // suggestion later too) - convenience only, subcategory itself stays
 // freeform text, not a fixed enum like category.
-function subcategorySuggestions() {
-  return db
+async function subcategorySuggestions() {
+  const rows = await db
     .prepare("SELECT DISTINCT subcategory FROM tickets WHERE subcategory IS NOT NULL AND subcategory != '' ORDER BY subcategory LIMIT 100")
-    .all()
-    .map((r) => r.subcategory);
+    .all();
+  return rows.map((r) => r.subcategory);
 }
 
 // "Sign in with Microsoft" for requesters (see src/msSso.js) - a separate
@@ -128,24 +128,29 @@ router.post("/requester/switch", verifyCsrf, (req, res) => {
   res.redirect("/");
 });
 
-router.get("/", (req, res) => {
-  if (requesterSsoRequired() && !req.session.requester) {
-    return res.render("public/request-landing", { title: t(req.lang, "landing_title"), error: null });
+router.get("/", async (req, res, next) => {
+  try {
+    if (requesterSsoRequired() && !req.session.requester) {
+      return res.render("public/request-landing", { title: t(req.lang, "landing_title"), error: null });
+    }
+    res.render("public/request-form", {
+      title: t(req.lang, "submit_request_title"),
+      categories: await departments.categoriesByDepartment(),
+      assets: await assets.assignable(),
+      customFieldsByCategory: await customFields.byCategory(),
+      subcategorySuggestions: await subcategorySuggestions(),
+      errors: [],
+      values: {},
+      uploadHint: LIMITS_HINT,
+      requester: req.session.requester || null,
+    });
+  } catch (err) {
+    next(err);
   }
-  res.render("public/request-form", {
-    title: t(req.lang, "submit_request_title"),
-    categories: departments.categoriesByDepartment(),
-    assets: assets.assignable(),
-    customFieldsByCategory: customFields.byCategory(),
-    subcategorySuggestions: subcategorySuggestions(),
-    errors: [],
-    values: {},
-    uploadHint: LIMITS_HINT,
-    requester: req.session.requester || null,
-  });
 });
 
-router.post("/", submitLimiter, handleUpload("attachments"), (req, res) => {
+router.post("/", submitLimiter, handleUpload("attachments"), async (req, res, next) => {
+  try {
   if (requesterSsoRequired() && !req.session.requester) {
     deleteUploadedFiles(req.files);
     return res.redirect("/");
@@ -176,7 +181,7 @@ router.post("/", submitLimiter, handleUpload("attachments"), (req, res) => {
   if (!requester_email.trim() || !EMAIL_RE.test(requester_email.trim())) {
     errors.push(t(req.lang, "err_email_invalid"));
   }
-  if (!departments.isValidCategoryName(category)) errors.push(t(req.lang, "err_category_invalid"));
+  if (!(await departments.isValidCategoryName(category))) errors.push(t(req.lang, "err_category_invalid"));
   if (!subject.trim()) errors.push(t(req.lang, "err_subject_required"));
   if (!description.trim()) errors.push(t(req.lang, "err_description_required"));
   if (subject.length > 200) errors.push(t(req.lang, "err_subject_too_long"));
@@ -185,17 +190,17 @@ router.post("/", submitLimiter, handleUpload("attachments"), (req, res) => {
   // any parseable integer, since this is the one field on this form a
   // client could otherwise use to link a ticket to an arbitrary asset id.
   const assetId = asset_id ? parseInt(asset_id, 10) : null;
-  if (assetId && !assets.get(assetId)) errors.push(t(req.lang, "err_asset_invalid"));
+  if (assetId && !(await assets.get(assetId))) errors.push(t(req.lang, "err_asset_invalid"));
   if (req.uploadError) errors.push(req.uploadError);
 
   if (errors.length) {
     deleteUploadedFiles(req.files);
     return res.status(400).render("public/request-form", {
       title: t(req.lang, "submit_request_title"),
-      categories: departments.categoriesByDepartment(),
-      assets: assets.assignable(),
-      customFieldsByCategory: customFields.byCategory(),
-      subcategorySuggestions: subcategorySuggestions(),
+      categories: await departments.categoriesByDepartment(),
+      assets: await assets.assignable(),
+      customFieldsByCategory: await customFields.byCategory(),
+      subcategorySuggestions: await subcategorySuggestions(),
       errors,
       values,
       uploadHint: LIMITS_HINT,
@@ -218,8 +223,8 @@ router.post("/", submitLimiter, handleUpload("attachments"), (req, res) => {
   // outside the department it was actually filed under. Falls back to
   // Unassigned if there are no active agents in that department at all,
   // rather than reaching into a different one.
-  const ticketDepartmentId = departments.departmentIdForCategory(category);
-  const nextAssignee = db
+  const ticketDepartmentId = await departments.departmentIdForCategory(category);
+  const nextAssignee = await db
     .prepare(
       `SELECT agents.id FROM agents
        LEFT JOIN tickets ON tickets.assigned_to = agents.id AND tickets.status IN ('Open', 'In Progress')
@@ -230,7 +235,7 @@ router.post("/", submitLimiter, handleUpload("attachments"), (req, res) => {
     )
     .get(ticketDepartmentId);
 
-  const result = db
+  const result = await db
     .prepare(
       `INSERT INTO tickets (subject, description, category, subcategory, requester_name, requester_email, assigned_to, asset_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -247,18 +252,18 @@ router.post("/", submitLimiter, handleUpload("attachments"), (req, res) => {
     );
 
   if (nextAssignee) {
-    db.prepare(
-      `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, NULL, 'assignment', ?)`
-    ).run(result.lastInsertRowid, "Auto-assigned on creation.");
+    await db
+      .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, NULL, 'assignment', ?)`)
+      .run(result.lastInsertRowid, "Auto-assigned on creation.");
   }
 
   // Runs after auto-assignment above, so a rule's own assignment action (if
   // any) is a deliberate override of the round-robin pick, not a race with it.
-  automation.applyRules(result.lastInsertRowid, { category, subject: subject.trim(), description: description.trim() });
+  await automation.applyRules(result.lastInsertRowid, { category, subject: subject.trim(), description: description.trim() });
 
-  customFields.saveSubmittedCustomFields(result.lastInsertRowid, category, req.body);
+  await customFields.saveSubmittedCustomFields(result.lastInsertRowid, category, req.body);
 
-  saveAttachments({ ticketId: result.lastInsertRowid, files: req.files, uploadedBy: "requester" });
+  await saveAttachments({ ticketId: result.lastInsertRowid, files: req.files, uploadedBy: "requester" });
 
   // Fire-and-forget: email delivery (or a missing/misconfigured SMTP setup)
   // must never hold up or fail the requester's redirect to their confirmation.
@@ -280,25 +285,30 @@ router.post("/", submitLimiter, handleUpload("attachments"), (req, res) => {
   );
 
   res.redirect(`/confirmation/${result.lastInsertRowid}`);
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/confirmation/:id", (req, res) => {
-  const ticket = db
-    .prepare("SELECT id, subject, status, created_at FROM tickets WHERE id = ?")
-    .get(req.params.id);
-  if (!ticket) return res.redirect("/");
-  // Attachment names only, no download links: unlike /status, this page has no
-  // ownership check (it's a plain post-submit redirect target), so it must not
-  // hand out a way to fetch file contents to anyone who can guess a ticket id.
-  const attachments = attachmentsForTicket(ticket.id, { requesterVisibleOnly: true });
-  res.render("public/confirmation", { title: "Request submitted", ticket, attachments });
+router.get("/confirmation/:id", async (req, res, next) => {
+  try {
+    const ticket = await db.prepare("SELECT id, subject, status, created_at FROM tickets WHERE id = ?").get(req.params.id);
+    if (!ticket) return res.redirect("/");
+    // Attachment names only, no download links: unlike /status, this page has no
+    // ownership check (it's a plain post-submit redirect target), so it must not
+    // hand out a way to fetch file contents to anyone who can guess a ticket id.
+    const attachments = await attachmentsForTicket(ticket.id, { requesterVisibleOnly: true });
+    res.render("public/confirmation", { title: "Request submitted", ticket, attachments });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // The requester-visible half of a ticket's conversation: agent replies
 // (type 'reply') and the requester's own past replies - never internal
 // notes or system events, which is the whole reason 'reply' exists as its
 // own type separate from 'note' (see src/db/index.js).
-function conversationForTicket(ticketId) {
+async function conversationForTicket(ticketId) {
   return db
     .prepare(
       `SELECT ticket_activity.*, agents.name AS agent_name
@@ -322,272 +332,296 @@ router.get("/status", requireRequesterSession, (req, res) => {
   });
 });
 
-router.post("/status", statusLimiter, requireRequesterSession, (req, res) => {
-  const { ticket_id = "" } = req.body;
-  const id = parseInt(ticket_id, 10);
-  // Once signed in, "the email used to submit it" is the verified session
-  // identity, not a re-typed field - the view doesn't even render that
-  // input in that case (see views/public/status-check.ejs).
-  const requesterEmail = req.session.requester ? req.session.requester.email : (req.body.requester_email || "").trim().toLowerCase();
+router.post("/status", statusLimiter, requireRequesterSession, async (req, res, next) => {
+  try {
+    const { ticket_id = "" } = req.body;
+    const id = parseInt(ticket_id, 10);
+    // Once signed in, "the email used to submit it" is the verified session
+    // identity, not a re-typed field - the view doesn't even render that
+    // input in that case (see views/public/status-check.ejs).
+    const requesterEmail = req.session.requester ? req.session.requester.email : (req.body.requester_email || "").trim().toLowerCase();
 
-  if (!id || !requesterEmail) {
-    return res.render("public/status-check", {
-      title: t(req.lang, "check_status_title"),
-      ticket: null,
-      attachments: [],
-      conversation: [],
-      error: t(req.lang, "err_status_missing_fields"),
-      mergedNotice: null,
-      requester: req.session.requester || null,
-    });
-  }
-
-  const ticket = db
-    .prepare(
-      `SELECT id, subject, description, category, priority, status, created_at, updated_at, requester_email, merged_into_id
-       FROM tickets WHERE id = ? AND requester_email = ?`
-    )
-    .get(id, requesterEmail);
-
-  if (!ticket) {
-    return res.render("public/status-check", {
-      title: t(req.lang, "check_status_title"),
-      ticket: null,
-      attachments: [],
-      conversation: [],
-      error: t(req.lang, "err_status_not_found"),
-      mergedNotice: null,
-      requester: req.session.requester || null,
-    });
-  }
-
-  // An agent may have since merged this ticket into another one (see
-  // /tickets/:id/merge in dashboard.js) - the requester typed a number that
-  // still exists and is still theirs, it just isn't where the conversation
-  // lives anymore. Transparently show them the surviving ticket instead of
-  // a stale, activity-less Closed ticket, same as the dashboard does for an
-  // agent who opens the merged-away ticket's own URL.
-  if (ticket.merged_into_id) {
-    const target = db
-      .prepare(
-        `SELECT id, subject, description, category, priority, status, created_at, updated_at, requester_email
-         FROM tickets WHERE id = ? AND requester_email = ?`
-      )
-      .get(ticket.merged_into_id, requesterEmail);
-
-    if (!target) {
-      // The merge target belongs to a different requester (an agent merged
-      // across two different people's tickets) - nothing to redirect them
-      // into, so just tell them where their conversation went.
+    if (!id || !requesterEmail) {
       return res.render("public/status-check", {
         title: t(req.lang, "check_status_title"),
         ticket: null,
         attachments: [],
         conversation: [],
-        error: t(req.lang, "status_merged_elsewhere", ticket.merged_into_id),
+        error: t(req.lang, "err_status_missing_fields"),
         mergedNotice: null,
         requester: req.session.requester || null,
       });
     }
 
-    return res.render("public/status-check", {
+    const ticket = await db
+      .prepare(
+        `SELECT id, subject, description, category, priority, status, created_at, updated_at, requester_email, merged_into_id
+         FROM tickets WHERE id = ? AND requester_email = ?`
+      )
+      .get(id, requesterEmail);
+
+    if (!ticket) {
+      return res.render("public/status-check", {
+        title: t(req.lang, "check_status_title"),
+        ticket: null,
+        attachments: [],
+        conversation: [],
+        error: t(req.lang, "err_status_not_found"),
+        mergedNotice: null,
+        requester: req.session.requester || null,
+      });
+    }
+
+    // An agent may have since merged this ticket into another one (see
+    // /tickets/:id/merge in dashboard.js) - the requester typed a number that
+    // still exists and is still theirs, it just isn't where the conversation
+    // lives anymore. Transparently show them the surviving ticket instead of
+    // a stale, activity-less Closed ticket, same as the dashboard does for an
+    // agent who opens the merged-away ticket's own URL.
+    if (ticket.merged_into_id) {
+      const target = await db
+        .prepare(
+          `SELECT id, subject, description, category, priority, status, created_at, updated_at, requester_email
+           FROM tickets WHERE id = ? AND requester_email = ?`
+        )
+        .get(ticket.merged_into_id, requesterEmail);
+
+      if (!target) {
+        // The merge target belongs to a different requester (an agent merged
+        // across two different people's tickets) - nothing to redirect them
+        // into, so just tell them where their conversation went.
+        return res.render("public/status-check", {
+          title: t(req.lang, "check_status_title"),
+          ticket: null,
+          attachments: [],
+          conversation: [],
+          error: t(req.lang, "status_merged_elsewhere", ticket.merged_into_id),
+          mergedNotice: null,
+          requester: req.session.requester || null,
+        });
+      }
+
+      const targetAttachments = await attachmentsForTicket(target.id, { requesterVisibleOnly: true });
+      return res.render("public/status-check", {
+        title: t(req.lang, "check_status_title"),
+        ticket: target,
+        attachments: targetAttachments.map((a) => ({
+          ...a,
+          size_label: formatSize(a.size_bytes),
+          is_previewable: SAFE_PREVIEW_TYPES.has(a.mime_type),
+        })),
+        conversation: await conversationForTicket(target.id),
+        error: null,
+        mergedNotice: t(req.lang, "status_merged_notice", ticket.id),
+        requester: req.session.requester || null,
+      });
+    }
+
+    const ticketAttachments = await attachmentsForTicket(ticket.id, { requesterVisibleOnly: true });
+    res.render("public/status-check", {
       title: t(req.lang, "check_status_title"),
-      ticket: target,
-      attachments: attachmentsForTicket(target.id, { requesterVisibleOnly: true }).map((a) => ({
+      ticket,
+      attachments: ticketAttachments.map((a) => ({
         ...a,
         size_label: formatSize(a.size_bytes),
         is_previewable: SAFE_PREVIEW_TYPES.has(a.mime_type),
       })),
-      conversation: conversationForTicket(target.id),
+      conversation: await conversationForTicket(ticket.id),
       error: null,
-      mergedNotice: t(req.lang, "status_merged_notice", ticket.id),
+      mergedNotice: null,
       requester: req.session.requester || null,
     });
+  } catch (err) {
+    next(err);
   }
-
-  res.render("public/status-check", {
-    title: t(req.lang, "check_status_title"),
-    ticket,
-    attachments: attachmentsForTicket(ticket.id, { requesterVisibleOnly: true }).map((a) => ({
-      ...a,
-      size_label: formatSize(a.size_bytes),
-      is_previewable: SAFE_PREVIEW_TYPES.has(a.mime_type),
-    })),
-    conversation: conversationForTicket(ticket.id),
-    error: null,
-    mergedNotice: null,
-    requester: req.session.requester || null,
-  });
 });
 
 // Same ownership check as everything else on /status (ticket id + the exact
 // requester email on file). If the ticket was Resolved or Closed, a reply
 // reopens it - the requester replying at all is a pretty strong signal it
 // isn't actually done, same as every major helpdesk tool does.
-router.post("/status/reply", statusLimiter, requireRequesterSession, (req, res) => {
-  const { ticket_id = "", message = "" } = req.body;
-  const id = parseInt(ticket_id, 10);
-  // Once signed in, use the verified session identity rather than trusting
-  // whatever the form's hidden requester_email field carried - it's always
-  // supposed to already match (the view fills it from the found ticket's
-  // own row), but the server enforces this independently regardless of
-  // what a tampered request actually sends.
-  const email = req.session.requester ? req.session.requester.email : (req.body.requester_email || "").trim().toLowerCase();
+router.post("/status/reply", statusLimiter, requireRequesterSession, async (req, res, next) => {
+  try {
+    const { ticket_id = "", message = "" } = req.body;
+    const id = parseInt(ticket_id, 10);
+    // Once signed in, use the verified session identity rather than trusting
+    // whatever the form's hidden requester_email field carried - it's always
+    // supposed to already match (the view fills it from the found ticket's
+    // own row), but the server enforces this independently regardless of
+    // what a tampered request actually sends.
+    const email = req.session.requester ? req.session.requester.email : (req.body.requester_email || "").trim().toLowerCase();
 
-  let ticket = db.prepare("SELECT * FROM tickets WHERE id = ? AND requester_email = ?").get(id, email);
-  if (!ticket) {
-    return res.status(404).render("error", { title: "Not found", message: "That ticket does not exist." });
-  }
+    let ticket = await db.prepare("SELECT * FROM tickets WHERE id = ? AND requester_email = ?").get(id, email);
+    if (!ticket) {
+      return res.status(404).render("error", { title: "Not found", message: "That ticket does not exist." });
+    }
 
-  // Same merge redirect as GET/POST /status above - a reply typed against a
-  // ticket number that's since been merged away should land on the ticket
-  // that's actually still active, not on a Closed ticket no agent is
-  // looking at anymore.
-  let mergedNotice = null;
-  if (ticket.merged_into_id) {
-    const target = db.prepare("SELECT * FROM tickets WHERE id = ? AND requester_email = ?").get(ticket.merged_into_id, email);
-    if (!target) {
-      return res.status(404).render("error", {
-        title: "Ticket merged",
-        message: `This ticket was merged into ticket #${ticket.merged_into_id}. Please check its status using that ticket number instead.`,
+    // Same merge redirect as GET/POST /status above - a reply typed against a
+    // ticket number that's since been merged away should land on the ticket
+    // that's actually still active, not on a Closed ticket no agent is
+    // looking at anymore.
+    let mergedNotice = null;
+    if (ticket.merged_into_id) {
+      const target = await db.prepare("SELECT * FROM tickets WHERE id = ? AND requester_email = ?").get(ticket.merged_into_id, email);
+      if (!target) {
+        return res.status(404).render("error", {
+          title: "Ticket merged",
+          message: `This ticket was merged into ticket #${ticket.merged_into_id}. Please check its status using that ticket number instead.`,
+        });
+      }
+      mergedNotice = t(req.lang, "status_merged_notice", ticket.id);
+      ticket = target;
+    }
+
+    const body = message.trim().slice(0, 5000);
+    if (!body) {
+      const attachments = await attachmentsForTicket(ticket.id, { requesterVisibleOnly: true });
+      return res.render("public/status-check", {
+        title: t(req.lang, "check_status_title"),
+        ticket,
+        attachments: attachments.map((a) => ({
+          ...a,
+          size_label: formatSize(a.size_bytes),
+          is_previewable: SAFE_PREVIEW_TYPES.has(a.mime_type),
+        })),
+        conversation: await conversationForTicket(ticket.id),
+        error: t(req.lang, "err_reply_empty"),
+        mergedNotice,
+        requester: req.session.requester || null,
       });
     }
-    mergedNotice = t(req.lang, "status_merged_notice", ticket.id);
-    ticket = target;
-  }
 
-  const body = message.trim().slice(0, 5000);
-  if (!body) {
-    return res.render("public/status-check", {
+    await db
+      .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, NULL, 'requester_reply', ?)`)
+      .run(ticket.id, body);
+
+    if (["Resolved", "Closed"].includes(ticket.status)) {
+      // Same approval reset as the agent-driven reopen path in dashboard.js's
+      // applyStatusChange: a ticket that was approved and closed, then
+      // reopened (here, by the requester replying), needs a fresh approval
+      // before it can close again rather than sailing through on last time's.
+      await db
+        .prepare(
+          "UPDATE tickets SET status = 'Open', updated_at = now_text(), sla_alerted_at = NULL, approval_status = NULL, approval_note = NULL WHERE id = ?"
+        )
+        .run(ticket.id);
+      await db
+        .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, NULL, 'status_change', ?)`)
+        .run(ticket.id, `Status changed from "${ticket.status}" to "Open" (reopened by requester reply).`);
+    } else {
+      await db.prepare("UPDATE tickets SET updated_at = now_text() WHERE id = ?").run(ticket.id);
+    }
+
+    if (ticket.assigned_to) {
+      const agent = await db.prepare("SELECT id, email FROM agents WHERE id = ?").get(ticket.assigned_to);
+      sendAgentNotifiedOfReply({
+        to: agent && agent.email,
+        ticketId: ticket.id,
+        subject: ticket.subject,
+        message: body,
+      }).catch((err) => console.error("Could not send agent-notified-of-reply email:", err.message));
+      if (agent) await notifications.create(agent.id, "reply", ticket.id, `The requester replied on ticket #${ticket.id}.`);
+    }
+    // Watchers get the same nudge as the assignee - "keep me posted" without
+    // being the one it's actually assigned to.
+    const watchers = await db
+      .prepare(
+        `SELECT agents.id, agents.email FROM ticket_watchers
+         JOIN agents ON agents.id = ticket_watchers.agent_id
+         WHERE ticket_watchers.ticket_id = ? AND agents.id != ?`
+      )
+      .all(ticket.id, ticket.assigned_to || -1);
+    for (const watcher of watchers) {
+      sendAgentNotifiedOfReply({ to: watcher.email, ticketId: ticket.id, subject: ticket.subject, message: body }).catch((err) =>
+        console.error("Could not send watcher-notified-of-reply email:", err.message)
+      );
+      await notifications.create(watcher.id, "reply", ticket.id, `The requester replied on ticket #${ticket.id} you're watching.`);
+    }
+
+    const updated = await db.prepare("SELECT * FROM tickets WHERE id = ?").get(ticket.id);
+    const attachments = await attachmentsForTicket(ticket.id, { requesterVisibleOnly: true });
+    res.render("public/status-check", {
       title: t(req.lang, "check_status_title"),
-      ticket,
-      attachments: attachmentsForTicket(ticket.id, { requesterVisibleOnly: true }).map((a) => ({
-      ...a,
-      size_label: formatSize(a.size_bytes),
-      is_previewable: SAFE_PREVIEW_TYPES.has(a.mime_type),
-    })),
-      conversation: conversationForTicket(ticket.id),
-      error: t(req.lang, "err_reply_empty"),
+      ticket: updated,
+      attachments: attachments.map((a) => ({
+        ...a,
+        size_label: formatSize(a.size_bytes),
+        is_previewable: SAFE_PREVIEW_TYPES.has(a.mime_type),
+      })),
+      conversation: await conversationForTicket(ticket.id),
+      error: null,
       mergedNotice,
       requester: req.session.requester || null,
     });
+  } catch (err) {
+    next(err);
   }
-
-  db.prepare(
-    `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, NULL, 'requester_reply', ?)`
-  ).run(ticket.id, body);
-
-  if (["Resolved", "Closed"].includes(ticket.status)) {
-    // Same approval reset as the agent-driven reopen path in dashboard.js's
-    // applyStatusChange: a ticket that was approved and closed, then
-    // reopened (here, by the requester replying), needs a fresh approval
-    // before it can close again rather than sailing through on last time's.
-    db.prepare(
-      "UPDATE tickets SET status = 'Open', updated_at = datetime('now'), sla_alerted_at = NULL, approval_status = NULL, approval_note = NULL WHERE id = ?"
-    ).run(ticket.id);
-    db.prepare(
-      `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, NULL, 'status_change', ?)`
-    ).run(ticket.id, `Status changed from "${ticket.status}" to "Open" (reopened by requester reply).`);
-  } else {
-    db.prepare("UPDATE tickets SET updated_at = datetime('now') WHERE id = ?").run(ticket.id);
-  }
-
-  if (ticket.assigned_to) {
-    const agent = db.prepare("SELECT id, email FROM agents WHERE id = ?").get(ticket.assigned_to);
-    sendAgentNotifiedOfReply({
-      to: agent && agent.email,
-      ticketId: ticket.id,
-      subject: ticket.subject,
-      message: body,
-    }).catch((err) => console.error("Could not send agent-notified-of-reply email:", err.message));
-    if (agent) notifications.create(agent.id, "reply", ticket.id, `The requester replied on ticket #${ticket.id}.`);
-  }
-  // Watchers get the same nudge as the assignee - "keep me posted" without
-  // being the one it's actually assigned to.
-  const watchers = db
-    .prepare(
-      `SELECT agents.id, agents.email FROM ticket_watchers
-       JOIN agents ON agents.id = ticket_watchers.agent_id
-       WHERE ticket_watchers.ticket_id = ? AND agents.id != ?`
-    )
-    .all(ticket.id, ticket.assigned_to || -1);
-  for (const watcher of watchers) {
-    sendAgentNotifiedOfReply({ to: watcher.email, ticketId: ticket.id, subject: ticket.subject, message: body }).catch((err) =>
-      console.error("Could not send watcher-notified-of-reply email:", err.message)
-    );
-    notifications.create(watcher.id, "reply", ticket.id, `The requester replied on ticket #${ticket.id} you're watching.`);
-  }
-
-  const updated = db.prepare("SELECT * FROM tickets WHERE id = ?").get(ticket.id);
-  res.render("public/status-check", {
-    title: t(req.lang, "check_status_title"),
-    ticket: updated,
-    attachments: attachmentsForTicket(ticket.id, { requesterVisibleOnly: true }).map((a) => ({
-      ...a,
-      size_label: formatSize(a.size_bytes),
-      is_previewable: SAFE_PREVIEW_TYPES.has(a.mime_type),
-    })),
-    conversation: conversationForTicket(ticket.id),
-    error: null,
-    mergedNotice,
-    requester: req.session.requester || null,
-  });
 });
 
 // Downloading a file requires the same proof of ownership as looking the ticket
 // up in the first place: the exact requester email on file. Same trust model
 // /status already uses, just extended to cover the attachment's bytes too.
-router.post("/status/attachments/:attachmentId/download", statusLimiter, requireRequesterSession, (req, res) => {
-  const { ticket_id = "" } = req.body;
-  const id = parseInt(ticket_id, 10);
-  const requesterEmail = req.session.requester ? req.session.requester.email : (req.body.requester_email || "").trim().toLowerCase();
+router.post("/status/attachments/:attachmentId/download", statusLimiter, requireRequesterSession, async (req, res, next) => {
+  try {
+    const { ticket_id = "" } = req.body;
+    const id = parseInt(ticket_id, 10);
+    const requesterEmail = req.session.requester ? req.session.requester.email : (req.body.requester_email || "").trim().toLowerCase();
 
-  const ticket = db
-    .prepare("SELECT id FROM tickets WHERE id = ? AND requester_email = ?")
-    .get(id, requesterEmail);
-  if (!ticket) {
-    return res.status(404).render("error", { title: "Not found", message: "That attachment does not exist." });
+    const ticket = await db.prepare("SELECT id FROM tickets WHERE id = ? AND requester_email = ?").get(id, requesterEmail);
+    if (!ticket) {
+      return res.status(404).render("error", { title: "Not found", message: "That attachment does not exist." });
+    }
+
+    const attachment = await getPublicAttachment(ticket.id, req.params.attachmentId);
+    if (!attachment) {
+      return res.status(404).render("error", { title: "Not found", message: "That attachment does not exist." });
+    }
+
+    res.download(path.join(ATTACHMENTS_DIR, attachment.stored_name), attachment.original_name);
+  } catch (err) {
+    next(err);
   }
-
-  const attachment = getPublicAttachment(ticket.id, req.params.attachmentId);
-  if (!attachment) {
-    return res.status(404).render("error", { title: "Not found", message: "That attachment does not exist." });
-  }
-
-  res.download(path.join(ATTACHMENTS_DIR, attachment.stored_name), attachment.original_name);
 });
 
 // Same ownership model as the download route above, but GET (an <img> tag
 // can't send a POST body) - ticket_id + requester_email travel as query
 // params instead. Only ever serves the narrow SAFE_PREVIEW_TYPES subset
 // inline; everything else still only ever force-downloads.
-router.get("/status/attachments/:attachmentId/preview", previewLimiter, requireRequesterSession, (req, res) => {
-  const id = parseInt(req.query.ticket_id, 10);
-  const email = req.session.requester ? req.session.requester.email : (req.query.requester_email || "").trim().toLowerCase();
+router.get("/status/attachments/:attachmentId/preview", previewLimiter, requireRequesterSession, async (req, res, next) => {
+  try {
+    const id = parseInt(req.query.ticket_id, 10);
+    const email = req.session.requester ? req.session.requester.email : (req.query.requester_email || "").trim().toLowerCase();
 
-  const ticket = db.prepare("SELECT id FROM tickets WHERE id = ? AND requester_email = ?").get(id, email);
-  if (!ticket) {
-    return res.status(404).render("error", { title: "Not found", message: "That attachment does not exist." });
+    const ticket = await db.prepare("SELECT id FROM tickets WHERE id = ? AND requester_email = ?").get(id, email);
+    if (!ticket) {
+      return res.status(404).render("error", { title: "Not found", message: "That attachment does not exist." });
+    }
+
+    const attachment = await getPublicAttachment(ticket.id, req.params.attachmentId);
+    if (!attachment || !SAFE_PREVIEW_TYPES.has(attachment.mime_type)) {
+      return res.status(404).render("error", { title: "Not found", message: "No preview is available for that attachment." });
+    }
+
+    res.setHeader("Content-Type", attachment.mime_type);
+    res.setHeader("Content-Disposition", "inline");
+    res.sendFile(path.join(ATTACHMENTS_DIR, attachment.stored_name));
+  } catch (err) {
+    next(err);
   }
-
-  const attachment = getPublicAttachment(ticket.id, req.params.attachmentId);
-  if (!attachment || !SAFE_PREVIEW_TYPES.has(attachment.mime_type)) {
-    return res.status(404).render("error", { title: "Not found", message: "No preview is available for that attachment." });
-  }
-
-  res.setHeader("Content-Type", attachment.mime_type);
-  res.setHeader("Content-Disposition", "inline");
-  res.sendFile(path.join(ATTACHMENTS_DIR, attachment.stored_name));
 });
 
-router.get("/kb", requireRequesterSession, (req, res) => {
-  const { category = "", q = "" } = req.query;
-  res.render("public/kb-list", {
-    title: "Help center",
-    articles: kb.publishedList({ category, q }),
-    filters: { category, q },
-    requester: req.session.requester || null,
-  });
+router.get("/kb", requireRequesterSession, async (req, res, next) => {
+  try {
+    const { category = "", q = "" } = req.query;
+    res.render("public/kb-list", {
+      title: "Help center",
+      articles: await kb.publishedList({ category, q }),
+      filters: { category, q },
+      requester: req.session.requester || null,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Live suggestions as a requester types their subject on the request form
@@ -597,92 +631,105 @@ router.get("/kb", requireRequesterSession, (req, res) => {
 // (not statusLimiter) since typing fires one request per keystroke-pause,
 // the same "fires repeatedly just from using the page" shape as attachment
 // previews, not a handful of deliberate page loads.
-router.get("/kb/suggest.json", previewLimiter, (req, res) => {
-  const q = (req.query.q || "").trim().slice(0, 200);
-  if (q.length < 3) return res.json([]);
-  const matches = kb.publishedList({ q }).slice(0, 4).map((a) => ({ title: a.title, slug: a.slug }));
-  res.json(matches);
+router.get("/kb/suggest.json", previewLimiter, async (req, res, next) => {
+  try {
+    const q = (req.query.q || "").trim().slice(0, 200);
+    if (q.length < 3) return res.json([]);
+    const results = await kb.publishedList({ q });
+    const matches = results.slice(0, 4).map((a) => ({ title: a.title, slug: a.slug }));
+    res.json(matches);
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/kb/:slug", requireRequesterSession, (req, res) => {
-  const article = kb.getBySlug(req.params.slug);
-  if (!article) {
-    return res.status(404).render("error", { title: "Not found", message: "That article doesn't exist or isn't published." });
+router.get("/kb/:slug", requireRequesterSession, async (req, res, next) => {
+  try {
+    const article = await kb.getBySlug(req.params.slug);
+    if (!article) {
+      return res.status(404).render("error", { title: "Not found", message: "That article doesn't exist or isn't published." });
+    }
+    res.render("public/kb-article", { title: article.title, article, requester: req.session.requester || null });
+  } catch (err) {
+    next(err);
   }
-  res.render("public/kb-article", { title: article.title, article, requester: req.session.requester || null });
 });
 
 // Reached via the link in the "ticket resolved" email, not a login - see the
 // ticket_ratings comment in src/db/index.js for the trust model this token
 // represents (a bearer capability to rate this one ticket, nothing more).
-function getTicketByRatingToken(token) {
+async function getTicketByRatingToken(token) {
   return db.prepare("SELECT id, subject FROM tickets WHERE rating_token = ?").get(token);
 }
 
-router.get("/rate/:token", statusLimiter, (req, res) => {
-  const ticket = getTicketByRatingToken(req.params.token);
-  if (!ticket) {
-    return res.status(404).render("error", { title: "Not found", message: "That rating link isn't valid." });
-  }
-  const existing = db.prepare("SELECT rating FROM ticket_ratings WHERE ticket_id = ?").get(ticket.id);
-  res.render("public/rate", {
-    title: "Rate your experience",
-    ticket,
-    token: req.params.token,
-    alreadyRated: Boolean(existing),
-    error: null,
-  });
-});
-
-router.post("/rate/:token", statusLimiter, (req, res) => {
-  const ticket = getTicketByRatingToken(req.params.token);
-  if (!ticket) {
-    return res.status(404).render("error", { title: "Not found", message: "That rating link isn't valid." });
-  }
-
-  const existing = db.prepare("SELECT rating FROM ticket_ratings WHERE ticket_id = ?").get(ticket.id);
-  if (existing) {
-    return res.render("public/rate", {
+router.get("/rate/:token", statusLimiter, async (req, res, next) => {
+  try {
+    const ticket = await getTicketByRatingToken(req.params.token);
+    if (!ticket) {
+      return res.status(404).render("error", { title: "Not found", message: "That rating link isn't valid." });
+    }
+    const existing = await db.prepare("SELECT rating FROM ticket_ratings WHERE ticket_id = ?").get(ticket.id);
+    res.render("public/rate", {
       title: "Rate your experience",
       ticket,
       token: req.params.token,
-      alreadyRated: true,
+      alreadyRated: Boolean(existing),
       error: null,
     });
+  } catch (err) {
+    next(err);
   }
+});
 
-  const rating = parseInt(req.body.rating, 10);
-  if (!(rating >= 1 && rating <= 5)) {
-    return res.status(400).render("public/rate", {
-      title: "Rate your experience",
-      ticket,
-      token: req.params.token,
-      alreadyRated: false,
-      error: "Choose a rating from 1 to 5 stars.",
-    });
-  }
-
-  const comment = (req.body.comment || "").trim().slice(0, 2000);
-  db.prepare("INSERT INTO ticket_ratings (ticket_id, rating, comment) VALUES (?, ?, ?)").run(
-    ticket.id,
-    rating,
-    comment || null
-  );
-
-  // A 1-2 star rating just sitting in the database is easy to miss - flag
-  // it to the whole active team the moment it comes in, the same "no
-  // single natural recipient" reasoning as the warranty digest.
-  if (rating <= 2) {
-    const activeAgents = db.prepare("SELECT id, email FROM agents WHERE active = 1").all();
-    for (const agent of activeAgents) {
-      sendLowRatingEscalation({ to: agent.email, ticketId: ticket.id, subject: ticket.subject, rating, comment }).catch(
-        (err) => console.error("Could not send low-rating escalation email:", err.message)
-      );
-      notifications.create(agent.id, "low_rating", ticket.id, `Ticket #${ticket.id} just got a ${rating}-star rating.`);
+router.post("/rate/:token", statusLimiter, async (req, res, next) => {
+  try {
+    const ticket = await getTicketByRatingToken(req.params.token);
+    if (!ticket) {
+      return res.status(404).render("error", { title: "Not found", message: "That rating link isn't valid." });
     }
-  }
 
-  res.render("public/rate", { title: "Rate your experience", ticket, alreadyRated: true, error: null });
+    const existing = await db.prepare("SELECT rating FROM ticket_ratings WHERE ticket_id = ?").get(ticket.id);
+    if (existing) {
+      return res.render("public/rate", {
+        title: "Rate your experience",
+        ticket,
+        token: req.params.token,
+        alreadyRated: true,
+        error: null,
+      });
+    }
+
+    const rating = parseInt(req.body.rating, 10);
+    if (!(rating >= 1 && rating <= 5)) {
+      return res.status(400).render("public/rate", {
+        title: "Rate your experience",
+        ticket,
+        token: req.params.token,
+        alreadyRated: false,
+        error: "Choose a rating from 1 to 5 stars.",
+      });
+    }
+
+    const comment = (req.body.comment || "").trim().slice(0, 2000);
+    await db.prepare("INSERT INTO ticket_ratings (ticket_id, rating, comment) VALUES (?, ?, ?)").run(ticket.id, rating, comment || null);
+
+    // A 1-2 star rating just sitting in the database is easy to miss - flag
+    // it to the whole active team the moment it comes in, the same "no
+    // single natural recipient" reasoning as the warranty digest.
+    if (rating <= 2) {
+      const activeAgents = await db.prepare("SELECT id, email FROM agents WHERE active = 1").all();
+      for (const agent of activeAgents) {
+        sendLowRatingEscalation({ to: agent.email, ticketId: ticket.id, subject: ticket.subject, rating, comment }).catch((err) =>
+          console.error("Could not send low-rating escalation email:", err.message)
+        );
+        await notifications.create(agent.id, "low_rating", ticket.id, `Ticket #${ticket.id} just got a ${rating}-star rating.`);
+      }
+    }
+
+    res.render("public/rate", { title: "Rate your experience", ticket, alreadyRated: true, error: null });
+  } catch (err) {
+    next(err);
+  }
 });
 
 module.exports = router;

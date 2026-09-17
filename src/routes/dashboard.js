@@ -56,19 +56,27 @@ router.use(requireAgent);
 
 // Makes the notification bell's contents available to the header partial on
 // every dashboard page, not just a dedicated notifications route.
-router.use((req, res, next) => {
-  res.locals.notifUnreadCount = notifications.unreadCount(req.session.agentId);
-  res.locals.notifRecent = notifications.recentFor(req.session.agentId);
-  next();
+router.use(async (req, res, next) => {
+  try {
+    res.locals.notifUnreadCount = await notifications.unreadCount(req.session.agentId);
+    res.locals.notifRecent = await notifications.recentFor(req.session.agentId);
+    next();
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Called by public/js/notifications-bell.js the moment the bell dropdown is
 // opened - marks everything read at once rather than needing a per-item
 // click, since the dropdown already shows the most recent ones regardless
 // of read state (see notifications.recentFor).
-router.post("/notifications/mark-all-read", verifyCsrf, (req, res) => {
-  notifications.markAllRead(req.session.agentId);
-  res.status(204).end();
+router.post("/notifications/mark-all-read", verifyCsrf, async (req, res, next) => {
+  try {
+    await notifications.markAllRead(req.session.agentId);
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Every route that operates on one ticket by id goes through this - the
@@ -79,9 +87,13 @@ router.post("/notifications/mark-all-read", verifyCsrf, (req, res) => {
 // department (and not visible via is_admin) 404s exactly like a ticket that
 // doesn't exist at all - never a distinguishable "forbidden", which would
 // leak that a given ticket id is real.
-function getTicketOr404(req, res, id) {
-  const ticket = db.prepare("SELECT * FROM tickets WHERE id = ?").get(id);
-  if (!ticket || !departments.canSeeTicket(res.locals.currentAgent, ticket)) {
+//
+// departments.canSeeTicket is now async (Postgres port) - awaited here
+// explicitly rather than left to chance, since `!somePromise` is always
+// false and would otherwise silently defeat this whole access-control gate.
+async function getTicketOr404(req, res, id) {
+  const ticket = await db.prepare("SELECT * FROM tickets WHERE id = ?").get(id);
+  if (!ticket || !(await departments.canSeeTicket(res.locals.currentAgent, ticket))) {
     res.status(404).render("error", { title: "Not found", message: "That ticket does not exist." });
     return null;
   }
@@ -93,9 +105,9 @@ function getTicketOr404(req, res, id) {
 // category dropdown (and validation) on agent-initiated ticket creation:
 // an agent files tickets for their own department, same as everything else
 // they can see and act on.
-function categoryNamesForAgent(agent) {
+async function categoryNamesForAgent(agent) {
   if (agent && agent.is_admin) return departments.categoryNames();
-  return departments.categoriesAll()
+  return (await departments.categoriesAll())
     .filter((c) => c.department_id === (agent && agent.department_id))
     .map((c) => c.name);
 }
@@ -106,8 +118,8 @@ function categoryNamesForAgent(agent) {
 // and, indirectly, the applyAssignment() eligibility check below (which
 // re-derives this server-side rather than trusting the submitted id came
 // from this same list).
-function eligibleAgentsForCategory(categoryName) {
-  const deptId = departments.departmentIdForCategory(categoryName);
+async function eligibleAgentsForCategory(categoryName) {
+  const deptId = await departments.departmentIdForCategory(categoryName);
   return db
     .prepare("SELECT id, name FROM agents WHERE active = 1 AND (is_admin = 1 OR department_id = ?) ORDER BY name")
     .all(deptId);
@@ -116,8 +128,8 @@ function eligibleAgentsForCategory(categoryName) {
 // Ticket templates whose category the agent is actually allowed to file a
 // ticket under - same categoryNamesForAgent() restriction as the new-ticket
 // form's own category select.
-function templatesForAgent(agent) {
-  const names = categoryNamesForAgent(agent);
+async function templatesForAgent(agent) {
+  const names = await categoryNamesForAgent(agent);
   if (!names.length) return [];
   const placeholders = names.map(() => "?").join(", ");
   return db.prepare(`SELECT id, name FROM ticket_templates WHERE category IN (${placeholders}) ORDER BY name`).all(...names);
@@ -127,25 +139,12 @@ function templatesForAgent(agent) {
 // datalist - same helper as in public.js, duplicated rather than shared
 // since it's a one-line query (matches how EMAIL_RE is handled the same way
 // across both route files).
-function subcategorySuggestions() {
-  return db
-    .prepare("SELECT DISTINCT subcategory FROM tickets WHERE subcategory IS NOT NULL AND subcategory != '' ORDER BY subcategory LIMIT 100")
-    .all()
-    .map((r) => r.subcategory);
-}
-
-// Turns free-text search input into a safe FTS5 MATCH expression. Each
-// whitespace-separated token becomes a quoted-literal prefix search
-// ("token"*) - wrapping in quotes means embedded FTS operators/punctuation
-// in the user's own input are always treated as literal text, never query
-// syntax, and the trailing * gives prefix matching ("keyb" finds
-// "keyboard"). Adjacent quoted terms AND together by default, so a
-// multi-word search requires every word to appear somewhere in the ticket,
-// not just as one exact contiguous phrase like the old LIKE-based search did.
-function buildFtsQuery(q) {
-  const tokens = q.match(/[\p{L}\p{N}]+/gu) || [];
-  if (!tokens.length) return null;
-  return tokens.map((t) => `"${t}"*`).join(" ");
+async function subcategorySuggestions() {
+  return (
+    await db
+      .prepare("SELECT DISTINCT subcategory FROM tickets WHERE subcategory IS NOT NULL AND subcategory != '' ORDER BY subcategory LIMIT 100")
+      .all()
+  ).map((r) => r.subcategory);
 }
 
 // Other still-open tickets whose subject shares words with this one - shown
@@ -156,7 +155,11 @@ function buildFtsQuery(q) {
 // merged away.
 // Shared by the dashboard home stat tiles and /reports, so the two can
 // never quietly show different numbers for the same thing.
-function ticketTimingStats(agent) {
+//
+// julianday(a) - julianday(b) (SQLite) has no Postgres equivalent function -
+// rewritten as EXTRACT(EPOCH FROM (a::timestamp - b::timestamp)) / 86400,
+// the number of days between two timestamps, matching julianday's own unit.
+async function ticketTimingStats(agent) {
   const vis = departments.ticketVisibilitySql(agent);
 
   // Average time from creation to Resolved, for tickets currently sitting in
@@ -166,9 +169,9 @@ function ticketTimingStats(agent) {
   // resolved, reopened, and left open again drops out (no current-Resolved
   // timestamp to measure to), which is the right call for "how long does it
   // take us to actually finish something."
-  const resolutionTime = db
+  const resolutionTime = await db
     .prepare(
-      `SELECT AVG(julianday(resolved_at.happened) - julianday(tickets.created_at)) AS avg_days, COUNT(*) AS count
+      `SELECT AVG(EXTRACT(EPOCH FROM (resolved_at.happened::timestamp - tickets.created_at::timestamp)) / 86400) AS avg_days, COUNT(*) AS count
        FROM tickets
        JOIN (
          SELECT ticket_id, MAX(created_at) AS happened
@@ -187,9 +190,9 @@ function ticketTimingStats(agent) {
   // special case. Unlike resolution time, this isn't restricted to
   // currently-Resolved/Closed tickets - a ticket that's still open can
   // still have a measured first response.
-  const firstResponseTime = db
+  const firstResponseTime = await db
     .prepare(
-      `SELECT AVG(julianday(first_response.happened) - julianday(tickets.created_at)) AS avg_days, COUNT(*) AS count
+      `SELECT AVG(EXTRACT(EPOCH FROM (first_response.happened::timestamp - tickets.created_at::timestamp)) / 86400) AS avg_days, COUNT(*) AS count
        FROM tickets
        JOIN (
          SELECT ticket_id, MIN(created_at) AS happened
@@ -204,29 +207,29 @@ function ticketTimingStats(agent) {
   return { resolutionTime, firstResponseTime };
 }
 
-function findPossibleDuplicates(agent, ticket) {
-  // Deliberately NOT buildFtsQuery's AND-every-word semantics (right for a
-  // human typing a specific search, wrong here - two people describing the
-  // same issue in their own words rarely share every word). ORs the
-  // ticket's own subject words together instead, ranked by FTS5's bm25
-  // relevance so the closest matches surface first even when the overlap is
-  // partial. Short/common words (<3 chars) are dropped to cut noise matches
-  // on stuff like "be" or "on".
+// Duplicate detection used to run against SQLite FTS5 (tickets_fts,
+// bm25() ranking) - Postgres full-text search (tsvector/ts_rank) is Phase 4
+// work, not bundled into this async-adapter pass. For now this falls back
+// to a plain LIKE-per-token OR scan, still ranked by number of matching
+// tokens (a cruder proxy for relevance than bm25, but keeps the feature
+// working rather than removing it until Phase 4 lands).
+async function findPossibleDuplicates(agent, ticket) {
   const tokens = (ticket.subject.match(/[\p{L}\p{N}]+/gu) || []).filter((t) => t.length >= 3);
   if (!tokens.length) return [];
-  const ftsQuery = tokens.map((t) => `"${t}"*`).join(" OR ");
   const vis = departments.ticketVisibilitySql(agent);
+  const likeClauses = tokens.map(() => "tickets.subject ILIKE ?").join(" OR ");
+  const likeParams = tokens.map((t) => `%${t}%`);
+  const rankExpr = tokens.map(() => "(CASE WHEN tickets.subject ILIKE ? THEN 1 ELSE 0 END)").join(" + ");
   return db
     .prepare(
       `SELECT tickets.id, tickets.subject, tickets.status, tickets.created_at
-       FROM tickets_fts
-       JOIN tickets ON tickets.id = tickets_fts.rowid
-       WHERE tickets_fts MATCH ? AND tickets.id != ? AND tickets.merged_into_id IS NULL
+       FROM tickets
+       WHERE (${likeClauses}) AND tickets.id != ? AND tickets.merged_into_id IS NULL
          AND tickets.status IN ('Open', 'In Progress')${vis.sql}
-       ORDER BY bm25(tickets_fts)
+       ORDER BY (${rankExpr}) DESC
        LIMIT 3`
     )
-    .all(ftsQuery, ticket.id, ...vis.params);
+    .all(...likeParams, ticket.id, ...vis.params, ...likeParams);
 }
 
 // Shared by the ticket list, its pagination count, and the CSV export, so the
@@ -234,7 +237,13 @@ function findPossibleDuplicates(agent, ticket) {
 // Always includes the acting agent's department (+ confidential-flag)
 // visibility restriction (departments.ticketVisibilitySql) - there is no
 // filter combination, including an empty one, that bypasses it.
-function buildTicketFilter(query, agent) {
+//
+// Free-text search (`q`) used SQLite FTS5 (buildFtsQuery/tickets_fts) -
+// Postgres full-text search is Phase 4 work, not bundled into this
+// async-adapter pass. Falls back to a plain (I)LIKE-both-sides search
+// against subject/description in the meantime, still fine for this app's
+// scale.
+async function buildTicketFilter(query, agent) {
   const { status = "", priority = "", category = "", assigned = "", tag = "", q = "" } = query;
   const vis = departments.ticketVisibilitySql(agent);
   let where = " WHERE 1 = 1" + vis.sql;
@@ -248,7 +257,7 @@ function buildTicketFilter(query, agent) {
     where += " AND tickets.priority = ?";
     params.push(priority);
   }
-  if (departments.isValidCategoryName(category)) {
+  if (await departments.isValidCategoryName(category)) {
     where += " AND tickets.category = ?";
     params.push(category);
   }
@@ -261,20 +270,14 @@ function buildTicketFilter(query, agent) {
   if (tag.trim()) {
     where += ` AND EXISTS (
       SELECT 1 FROM ticket_tags JOIN tags ON tags.id = ticket_tags.tag_id
-      WHERE ticket_tags.ticket_id = tickets.id AND tags.name = ? COLLATE NOCASE
+      WHERE ticket_tags.ticket_id = tickets.id AND LOWER(tags.name) = LOWER(?)
     )`;
     params.push(tag.trim());
   }
   if (q.trim()) {
-    const ftsQuery = buildFtsQuery(q);
     const like = `%${q.trim()}%`;
-    if (ftsQuery) {
-      where += ` AND (tickets.id IN (SELECT rowid FROM tickets_fts WHERE tickets_fts MATCH ?) OR tickets.requester_name LIKE ? OR tickets.requester_email LIKE ?)`;
-      params.push(ftsQuery, like, like);
-    } else {
-      where += " AND (tickets.requester_name LIKE ? OR tickets.requester_email LIKE ?)";
-      params.push(like, like);
-    }
+    where += " AND (tickets.subject ILIKE ? OR tickets.description ILIKE ? OR tickets.requester_name ILIKE ? OR tickets.requester_email ILIKE ?)";
+    params.push(like, like, like, like);
   }
 
   return { where, params, filters: { status, priority, category, assigned, tag, q } };
@@ -288,144 +291,154 @@ function buildTicketFilter(query, agent) {
 // (departments.isEligibleAssignee) is still enforced when the action is
 // actually applied, so this is about what's sensible to show, not the only
 // enforcement.
-function agentsForBulkAssign(agent) {
+async function agentsForBulkAssign(agent) {
   if (agent && agent.is_admin) return db.prepare("SELECT id, name FROM agents WHERE active = 1 ORDER BY name").all();
   return db
     .prepare("SELECT id, name FROM agents WHERE active = 1 AND (is_admin = 1 OR department_id = ?) ORDER BY name")
     .all(agent && agent.department_id);
 }
 
-router.get("/", (req, res) => {
-  const agent = res.locals.currentAgent;
-  const { where, params, filters } = buildTicketFilter(req.query, agent);
+router.get("/", async (req, res, next) => {
+  try {
+    const agent = res.locals.currentAgent;
+    const { where, params, filters } = await buildTicketFilter(req.query, agent);
 
-  const totalCount = db
-    .prepare(`SELECT COUNT(*) AS count FROM tickets${where}`)
-    .get(...params).count;
-  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
-  const page = Math.min(Math.max(parseInt(req.query.page, 10) || 1, 1), totalPages);
-  const offset = (page - 1) * PAGE_SIZE;
+    const totalCount = Number((await db.prepare(`SELECT COUNT(*) AS count FROM tickets${where}`).get(...params)).count);
+    const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+    const page = Math.min(Math.max(parseInt(req.query.page, 10) || 1, 1), totalPages);
+    const offset = (page - 1) * PAGE_SIZE;
 
-  const sql = `
-    SELECT tickets.*, agents.name AS assigned_name
-    FROM tickets
-    LEFT JOIN agents ON agents.id = tickets.assigned_to
-    ${where}
-    ORDER BY
-      CASE tickets.status WHEN 'Open' THEN 0 WHEN 'In Progress' THEN 1 WHEN 'Waiting on Customer' THEN 2 WHEN 'Resolved' THEN 3 ELSE 4 END,
-      CASE tickets.priority WHEN 'Urgent' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
-      tickets.created_at DESC
-    LIMIT ? OFFSET ?
-  `;
-  // is_aging can no longer be a SQL predicate (business-hours math isn't
-  // expressible in plain SQLite - see src/aging.js) - annotated on the
-  // already-paginated page of rows instead, not the whole table.
-  const tickets = annotateAging(db.prepare(sql).all(...params, PAGE_SIZE, offset));
+    const sql = `
+      SELECT tickets.*, agents.name AS assigned_name
+      FROM tickets
+      LEFT JOIN agents ON agents.id = tickets.assigned_to
+      ${where}
+      ORDER BY
+        CASE tickets.status WHEN 'Open' THEN 0 WHEN 'In Progress' THEN 1 WHEN 'Waiting on Customer' THEN 2 WHEN 'Resolved' THEN 3 ELSE 4 END,
+        CASE tickets.priority WHEN 'Urgent' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
+        tickets.created_at DESC
+      LIMIT ? OFFSET ?
+    `;
+    // is_aging can no longer be a SQL predicate (business-hours math isn't
+    // expressible in plain SQL - see src/aging.js) - annotated on the
+    // already-paginated page of rows instead, not the whole table.
+    const tickets = await annotateAging(await db.prepare(sql).all(...params, PAGE_SIZE, offset));
 
-  // Both stat tiles below are scoped the same way as the ticket list itself
-  // (departments.ticketVisibilitySql) - an agent's own dashboard should never
-  // hint at another department's volume or satisfaction numbers.
-  const vis = departments.ticketVisibilitySql(agent);
-  const counts = db
-    .prepare(`SELECT status, COUNT(*) AS count FROM tickets WHERE 1 = 1${vis.sql} GROUP BY status`)
-    .all(...vis.params)
-    .reduce((acc, row) => ({ ...acc, [row.status]: row.count }), {});
+    // Both stat tiles below are scoped the same way as the ticket list itself
+    // (departments.ticketVisibilitySql) - an agent's own dashboard should never
+    // hint at another department's volume or satisfaction numbers.
+    const vis = departments.ticketVisibilitySql(agent);
+    const countRows = await db.prepare(`SELECT status, COUNT(*) AS count FROM tickets WHERE 1 = 1${vis.sql} GROUP BY status`).all(...vis.params);
+    const counts = countRows.reduce((acc, row) => ({ ...acc, [row.status]: Number(row.count) }), {});
 
-  const satisfaction = db
-    .prepare(
-      `SELECT AVG(ticket_ratings.rating) AS avg_rating, COUNT(*) AS count
-       FROM ticket_ratings JOIN tickets ON tickets.id = ticket_ratings.ticket_id
-       WHERE 1 = 1${vis.sql}`
-    )
-    .get(...vis.params);
+    const satisfactionRow = await db
+      .prepare(
+        `SELECT AVG(ticket_ratings.rating) AS avg_rating, COUNT(*) AS count
+         FROM ticket_ratings JOIN tickets ON tickets.id = ticket_ratings.ticket_id
+         WHERE 1 = 1${vis.sql}`
+      )
+      .get(...vis.params);
+    const satisfaction = {
+      avg_rating: satisfactionRow.avg_rating == null ? null : Number(satisfactionRow.avg_rating),
+      count: Number(satisfactionRow.count),
+    };
 
-  const { resolutionTime, firstResponseTime } = ticketTimingStats(agent);
+    const { resolutionTime, firstResponseTime } = await ticketTimingStats(agent);
 
-  const exportQuery = new URLSearchParams(
-    Object.fromEntries(Object.entries(filters).filter(([, v]) => v))
-  ).toString();
+    const exportQuery = new URLSearchParams(Object.fromEntries(Object.entries(filters).filter(([, v]) => v))).toString();
 
-  const rawReportRange = resolveReportRange(req.query);
-  const reportUnit = reportBucketUnit(rawReportRange.from, rawReportRange.to);
-  const reportRange = { ...rawReportRange, unit: reportUnit, label: reportRangeLabel(rawReportRange) };
+    const rawReportRange = resolveReportRange(req.query);
+    const reportUnit = reportBucketUnit(rawReportRange.from, rawReportRange.to);
+    const reportRange = { ...rawReportRange, unit: reportUnit, label: reportRangeLabel(rawReportRange) };
 
-  res.render("dashboard/home", {
-    title: "Dashboard",
-    wide: true,
-    tickets,
-    counts,
-    satisfaction,
-    resolutionTime,
-    firstResponseTime,
-    statuses: STATUSES,
-    priorities: PRIORITIES,
-    categories: categoryNamesForAgent(agent),
-    allTags: allTags(),
-    agents: agentsForBulkAssign(agent),
-    filters,
-    page,
-    totalPages,
-    totalCount,
-    exportQuery,
-    savedViews: db.prepare("SELECT * FROM saved_views WHERE agent_id = ? ORDER BY created_at DESC").all(req.session.agentId),
-    reportRange,
-    ...buildReportsData(rawReportRange, reportUnit, agent),
-  });
+    res.render("dashboard/home", {
+      title: "Dashboard",
+      wide: true,
+      tickets,
+      counts,
+      satisfaction,
+      resolutionTime,
+      firstResponseTime,
+      statuses: STATUSES,
+      priorities: PRIORITIES,
+      categories: await categoryNamesForAgent(agent),
+      allTags: await allTags(),
+      agents: await agentsForBulkAssign(agent),
+      filters,
+      page,
+      totalPages,
+      totalCount,
+      exportQuery,
+      savedViews: await db.prepare("SELECT * FROM saved_views WHERE agent_id = ? ORDER BY created_at DESC").all(req.session.agentId),
+      reportRange,
+      ...(await buildReportsData(rawReportRange, reportUnit, agent)),
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // A saved view is just the current filter combo (not the page number - that
 // wouldn't make sense to replay) under a name, scoped to whoever saved it.
-router.post("/views", verifyCsrf, (req, res) => {
-  const name = (req.body.name || "").trim().slice(0, 100);
-  const queryString = (req.body.query_string || "").slice(0, 1000);
-  if (name) {
-    db.prepare("INSERT INTO saved_views (agent_id, name, query_string) VALUES (?, ?, ?)").run(
-      req.session.agentId,
-      name,
-      queryString
-    );
+router.post("/views", verifyCsrf, async (req, res, next) => {
+  try {
+    const name = (req.body.name || "").trim().slice(0, 100);
+    const queryString = (req.body.query_string || "").slice(0, 1000);
+    if (name) {
+      await db.prepare("INSERT INTO saved_views (agent_id, name, query_string) VALUES (?, ?, ?)").run(req.session.agentId, name, queryString);
+    }
+    res.redirect(queryString ? `/dashboard?${queryString}` : "/dashboard");
+  } catch (err) {
+    next(err);
   }
-  res.redirect(queryString ? `/dashboard?${queryString}` : "/dashboard");
 });
 
 // Scoped to the requesting agent - unlike tickets/assets, a saved view is a
 // personal convenience, not a shared team resource, so one agent shouldn't
 // be able to delete another's.
-router.post("/views/:id/delete", verifyCsrf, (req, res) => {
-  db.prepare("DELETE FROM saved_views WHERE id = ? AND agent_id = ?").run(req.params.id, req.session.agentId);
-  res.redirect("/dashboard");
+router.post("/views/:id/delete", verifyCsrf, async (req, res, next) => {
+  try {
+    await db.prepare("DELETE FROM saved_views WHERE id = ? AND agent_id = ?").run(req.params.id, req.session.agentId);
+    res.redirect("/dashboard");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/export.csv", (req, res) => {
-  const { where, params } = buildTicketFilter(req.query, res.locals.currentAgent);
+router.get("/export.csv", async (req, res, next) => {
+  try {
+    const { where, params } = await buildTicketFilter(req.query, res.locals.currentAgent);
 
-  const tickets = db
-    .prepare(
-      `SELECT tickets.*, agents.name AS assigned_name
-       FROM tickets
-       LEFT JOIN agents ON agents.id = tickets.assigned_to
-       ${where}
-       ORDER BY tickets.created_at DESC`
-    )
-    .all(...params);
+    const tickets = await db
+      .prepare(
+        `SELECT tickets.*, agents.name AS assigned_name
+         FROM tickets
+         LEFT JOIN agents ON agents.id = tickets.assigned_to
+         ${where}
+         ORDER BY tickets.created_at DESC`
+      )
+      .all(...params);
 
-  const csv = toCsv(tickets, [
-    { key: "id", header: "ID" },
-    { key: "subject", header: "Subject" },
-    { key: "requester_name", header: "Requester name" },
-    { key: "requester_email", header: "Requester email" },
-    { key: "category", header: "Category" },
-    { key: "subcategory", header: "Subcategory" },
-    { key: "priority", header: "Priority" },
-    { key: "status", header: "Status" },
-    { key: "assigned_name", header: "Assigned to" },
-    { key: "created_at", header: "Created" },
-    { key: "updated_at", header: "Updated" },
-  ]);
+    const csv = toCsv(tickets, [
+      { key: "id", header: "ID" },
+      { key: "subject", header: "Subject" },
+      { key: "requester_name", header: "Requester name" },
+      { key: "requester_email", header: "Requester email" },
+      { key: "category", header: "Category" },
+      { key: "subcategory", header: "Subcategory" },
+      { key: "priority", header: "Priority" },
+      { key: "status", header: "Status" },
+      { key: "assigned_name", header: "Assigned to" },
+      { key: "created_at", header: "Created" },
+      { key: "updated_at", header: "Updated" },
+    ]);
 
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="tickets-${Date.now()}.csv"`);
-  res.send(csv);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="tickets-${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Agent-initiated creation - for a phone call or a walk-in, where the
@@ -433,297 +446,307 @@ router.get("/export.csv", (req, res) => {
 // /tickets/:id so Express doesn't match "new" as an :id first. Unlike the
 // public form, priority can be set immediately and the agent can assign it
 // (or leave it unassigned) rather than always going through round-robin.
-router.get("/tickets/new", (req, res) => {
-  // ?template=<id> pre-fills category/subject/description from a saved
-  // template (see /dashboard/templates) - a real navigation with a query
-  // param, not a client-side field-sync script, since it's three fields at
-  // once and a GET link is simpler and more robust than keeping three
-  // separate inputs in sync via JS.
-  let values = {};
-  // Checklist items on this template that spawn their own ticket elsewhere
-  // (see src/checklists.js) - shown as an upfront "this will also create..."
-  // hint, and carried through as values.template_id so the POST below knows
-  // which template's checklist to apply once the ticket is actually created.
-  let spawnPreview = [];
-  if (req.query.template) {
-    const template = db.prepare("SELECT * FROM ticket_templates WHERE id = ?").get(req.query.template);
-    if (template) {
-      values = { category: template.category, subject: template.subject, description: template.description, template_id: template.id };
-      spawnPreview = checklists.itemsForTemplate(template.id).filter((i) => i.spawn_category);
+router.get("/tickets/new", async (req, res, next) => {
+  try {
+    // ?template=<id> pre-fills category/subject/description from a saved
+    // template (see /dashboard/templates) - a real navigation with a query
+    // param, not a client-side field-sync script, since it's three fields at
+    // once and a GET link is simpler and more robust than keeping three
+    // separate inputs in sync via JS.
+    let values = {};
+    // Checklist items on this template that spawn their own ticket elsewhere
+    // (see src/checklists.js) - shown as an upfront "this will also create..."
+    // hint, and carried through as values.template_id so the POST below knows
+    // which template's checklist to apply once the ticket is actually created.
+    let spawnPreview = [];
+    if (req.query.template) {
+      const template = await db.prepare("SELECT * FROM ticket_templates WHERE id = ?").get(req.query.template);
+      if (template) {
+        values = { category: template.category, subject: template.subject, description: template.description, template_id: template.id };
+        spawnPreview = (await checklists.itemsForTemplate(template.id)).filter((i) => i.spawn_category);
+      }
     }
-  }
-  const agent = res.locals.currentAgent;
-  res.render("dashboard/new-ticket", {
-    title: "New ticket",
-    categories: categoryNamesForAgent(agent),
-    priorities: PRIORITIES,
-    assets: assets.assignable(),
-    agents: agentsForBulkAssign(agent),
-    templates: templatesForAgent(agent),
-    customFieldsByCategory: customFields.byCategory(),
-    subcategorySuggestions: subcategorySuggestions(),
-    errors: [],
-    values,
-    spawnPreview,
-    uploadHint: LIMITS_HINT,
-  });
-});
-
-router.post("/tickets/new", handleUpload("attachments"), verifyCsrf, (req, res) => {
-  const agent = res.locals.currentAgent;
-  const {
-    requester_name = "",
-    requester_email = "",
-    category = "",
-    subcategory = "",
-    subject = "",
-    description = "",
-    priority = "Medium",
-    asset_id = "",
-    assigned_to = "",
-    template_id = "",
-  } = req.body;
-
-  const values = { requester_name, requester_email, category, subcategory, subject, description, priority, asset_id, assigned_to };
-  const errors = [];
-  const rerender = () => {
-    deleteUploadedFiles(req.files);
-    return res.status(400).render("dashboard/new-ticket", {
+    const agent = res.locals.currentAgent;
+    res.render("dashboard/new-ticket", {
       title: "New ticket",
-      categories: categoryNamesForAgent(agent),
+      categories: await categoryNamesForAgent(agent),
       priorities: PRIORITIES,
-      assets: assets.assignable(),
-      agents: agentsForBulkAssign(agent),
-      templates: templatesForAgent(agent),
-      customFieldsByCategory: customFields.byCategory(),
-      subcategorySuggestions: subcategorySuggestions(),
-      errors,
+      assets: await assets.assignable(),
+      agents: await agentsForBulkAssign(agent),
+      templates: await templatesForAgent(agent),
+      customFieldsByCategory: await customFields.byCategory(),
+      subcategorySuggestions: await subcategorySuggestions(),
+      errors: [],
       values,
-      spawnPreview: [],
+      spawnPreview,
       uploadHint: LIMITS_HINT,
     });
-  };
-
-  if (!requester_name.trim()) errors.push("The requester's name is required.");
-  if (!requester_email.trim() || !EMAIL_RE.test(requester_email.trim())) errors.push("A valid requester email is required.");
-  // An agent can only file a ticket under their own department's categories
-  // (an admin can use any) - same "only your own department" rule as
-  // everything else this agent can see/act on.
-  if (!categoryNamesForAgent(agent).includes(category)) errors.push("Please choose a valid category.");
-  if (!PRIORITIES.includes(priority)) errors.push("Please choose a valid priority.");
-  if (!subject.trim()) errors.push("A subject is required.");
-  if (!description.trim()) errors.push("A description is required.");
-  const assetId = asset_id ? parseInt(asset_id, 10) : null;
-  if (assetId && !assets.get(assetId)) errors.push("Please choose a valid asset.");
-  const assignedTo = assigned_to ? parseInt(assigned_to, 10) : null;
-  if (assignedTo) {
-    const assignee = db.prepare("SELECT id, department_id, is_admin FROM agents WHERE id = ? AND active = 1").get(assignedTo);
-    if (!assignee || !departments.isEligibleAssignee(assignee, category)) {
-      errors.push("Please choose a valid, active agent in this ticket's department.");
-    }
+  } catch (err) {
+    next(err);
   }
-  if (req.uploadError) errors.push(req.uploadError);
-  if (errors.length) return rerender();
-
-  const result = db
-    .prepare(
-      `INSERT INTO tickets (subject, description, category, subcategory, priority, requester_name, requester_email, assigned_to, asset_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      subject.trim(),
-      description.trim(),
-      category,
-      subcategory.trim().slice(0, 100) || null,
-      priority,
-      requester_name.trim(),
-      requester_email.trim().toLowerCase(),
-      assignedTo,
-      assetId
-    );
-
-  const creatingAgent = db.prepare("SELECT name FROM agents WHERE id = ?").get(req.session.agentId);
-  db.prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`).run(
-    result.lastInsertRowid,
-    req.session.agentId,
-    `Created by ${creatingAgent.name} on behalf of ${requester_name.trim()}.`
-  );
-  customFields.saveSubmittedCustomFields(result.lastInsertRowid, category, req.body);
-  if (assignedTo) {
-    const label = db.prepare("SELECT name FROM agents WHERE id = ?").get(assignedTo).name;
-    db.prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'assignment', ?)`).run(
-      result.lastInsertRowid,
-      req.session.agentId,
-      `Assigned to ${label}.`
-    );
-  }
-  if (req.files && req.files.length) {
-    saveAttachments({ ticketId: result.lastInsertRowid, files: req.files, uploadedBy: "agent", agentId: req.session.agentId });
-  }
-
-  // Onboarding-checklist spawns (see src/checklists.js) - only when this
-  // ticket was actually created FROM that exact template, for that
-  // template's own category (not just any request that happens to carry a
-  // template_id field): template_id round-trips through the new-ticket
-  // form as a hidden input set only by the ?template= prefill, and
-  // category was already validated above against categoryNamesForAgent(),
-  // so tying the spawn to "template.category === the category just used"
-  // means this can't be used to wire up spawns the agent didn't actually
-  // ask for by picking that template.
-  const templateId = template_id ? parseInt(template_id, 10) : null;
-  if (templateId) {
-    const template = db.prepare("SELECT * FROM ticket_templates WHERE id = ?").get(templateId);
-    if (template && template.category === category) {
-      checklists.applyTemplateSpawns({
-        templateId,
-        originTicket: {
-          id: result.lastInsertRowid,
-          subject: subject.trim(),
-          requester_name: requester_name.trim(),
-          requester_email: requester_email.trim().toLowerCase(),
-        },
-        agentId: req.session.agentId,
-      });
-    }
-  }
-
-  sendTicketCreatedEmail({
-    to: requester_email.trim().toLowerCase(),
-    ticketId: result.lastInsertRowid,
-    subject: subject.trim(),
-  }).catch((err) => console.error("Could not send ticket-created email:", err.message));
-  triggerWebhooks(
-    "ticket.created",
-    {
-      ticket_id: result.lastInsertRowid,
-      subject: subject.trim(),
-      category,
-      requester_email: requester_email.trim().toLowerCase(),
-    },
-    departments.departmentIdForCategory(category)
-  );
-
-  res.redirect(`/dashboard/tickets/${result.lastInsertRowid}`);
 });
 
-router.get("/tickets/:id", async (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/new", handleUpload("attachments"), verifyCsrf, async (req, res, next) => {
+  try {
+    const agent = res.locals.currentAgent;
+    const {
+      requester_name = "",
+      requester_email = "",
+      category = "",
+      subcategory = "",
+      subject = "",
+      description = "",
+      priority = "Medium",
+      asset_id = "",
+      assigned_to = "",
+      template_id = "",
+    } = req.body;
 
-  // A merged-away ticket has nothing left to show on its own page - all of
-  // its activity/attachments/tags moved to the target when it was merged
-  // (see /tickets/:id/merge below). Land the agent on the actually-active
-  // ticket instead of a dead end, with a one-time banner naming where they
-  // came from.
-  if (ticket.merged_into_id) {
-    return res.redirect(`/dashboard/tickets/${ticket.merged_into_id}?merged_from=${ticket.id}`);
-  }
+    const values = { requester_name, requester_email, category, subcategory, subject, description, priority, asset_id, assigned_to };
+    const errors = [];
+    const rerender = async () => {
+      deleteUploadedFiles(req.files);
+      return res.status(400).render("dashboard/new-ticket", {
+        title: "New ticket",
+        categories: await categoryNamesForAgent(agent),
+        priorities: PRIORITIES,
+        assets: await assets.assignable(),
+        agents: await agentsForBulkAssign(agent),
+        templates: await templatesForAgent(agent),
+        customFieldsByCategory: await customFields.byCategory(),
+        subcategorySuggestions: await subcategorySuggestions(),
+        errors,
+        values,
+        spawnPreview: [],
+        uploadHint: LIMITS_HINT,
+      });
+    };
 
-  // LEFT JOIN, not JOIN: a 'requester_reply' row has no agent_id at all (the
-  // requester isn't an agent), and an INNER JOIN would silently drop those
-  // rows from the feed entirely instead of just showing no agent name.
-  const activity = db
-    .prepare(
-      `SELECT ticket_activity.*, agents.name AS agent_name
-       FROM ticket_activity
-       LEFT JOIN agents ON agents.id = ticket_activity.agent_id
-       WHERE ticket_id = ?
-       ORDER BY created_at ASC`
-    )
-    .all(ticket.id);
+    if (!requester_name.trim()) errors.push("The requester's name is required.");
+    if (!requester_email.trim() || !EMAIL_RE.test(requester_email.trim())) errors.push("A valid requester email is required.");
+    // An agent can only file a ticket under their own department's categories
+    // (an admin can use any) - same "only your own department" rule as
+    // everything else this agent can see/act on.
+    if (!(await categoryNamesForAgent(agent)).includes(category)) errors.push("Please choose a valid category.");
+    if (!PRIORITIES.includes(priority)) errors.push("Please choose a valid priority.");
+    if (!subject.trim()) errors.push("A subject is required.");
+    if (!description.trim()) errors.push("A description is required.");
+    const assetId = asset_id ? parseInt(asset_id, 10) : null;
+    if (assetId && !(await assets.get(assetId))) errors.push("Please choose a valid asset.");
+    const assignedTo = assigned_to ? parseInt(assigned_to, 10) : null;
+    if (assignedTo) {
+      const assignee = await db.prepare("SELECT id, department_id, is_admin FROM agents WHERE id = ? AND active = 1").get(assignedTo);
+      if (!assignee || !(await departments.isEligibleAssignee(assignee, category))) {
+        errors.push("Please choose a valid, active agent in this ticket's department.");
+      }
+    }
+    if (req.uploadError) errors.push(req.uploadError);
+    if (errors.length) return await rerender();
 
-  // Agents eligible for this ticket's department (see
-  // departments.isEligibleAssignee), plus whoever it's currently assigned to
-  // even if they've since been deactivated or moved departments - otherwise
-  // the dropdown would silently reassign the ticket the moment anyone loads
-  // this page and re-submits the form without touching the select.
-  const agents = db
-    .prepare(
-      `SELECT id, name FROM agents
-       WHERE (active = 1 AND (is_admin = 1 OR department_id = ?)) OR id = ?
-       ORDER BY name`
-    )
-    .all(departments.departmentIdForCategory(ticket.category), ticket.assigned_to);
-  const attachments = attachmentsForTicket(ticket.id).map((a) => ({
-    ...a,
-    size_label: formatSize(a.size_bytes),
-    is_previewable: SAFE_PREVIEW_TYPES.has(a.mime_type),
-  }));
-  const rating = db.prepare("SELECT rating, comment FROM ticket_ratings WHERE ticket_id = ?").get(ticket.id);
-  // Skipped once this ticket's own data has been erased - its requester_email
-  // is now the same shared redaction placeholder every erased ticket gets,
-  // so matching on it would incorrectly group unrelated erased requesters
-  // together under "from this requester".
-  const otherTickets = ticket.data_erased_at
-    ? []
-    : db
-        .prepare(
-          `SELECT id, subject, status, created_at FROM tickets
-           WHERE requester_email = ? AND id != ?
-           ORDER BY created_at DESC`
-        )
-        .all(ticket.requester_email, ticket.id);
-
-  const linkedTickets = db
-    .prepare(
-      `SELECT tickets.id, tickets.subject, tickets.status FROM ticket_links
-       JOIN tickets ON tickets.id = ticket_links.linked_ticket_id
-       WHERE ticket_links.ticket_id = ?
-       ORDER BY tickets.created_at DESC`
-    )
-    .all(ticket.id);
-
-  // Skipped once this ticket's data has been erased (GDPR) - the stored
-  // requester_email is the shared redaction placeholder by then, not a
-  // real address, and looking it up would defeat the point of erasing it
-  // in the first place.
-  const requesterProfile = ticket.data_erased_at ? null : await directory.getProfile(ticket.requester_email);
-
-  res.render("dashboard/ticket", {
-    title: `Ticket #${ticket.id}`,
-    ticket,
-    activity,
-    agents,
-    attachments,
-    aging: isAgingTicket(ticket),
-    tags: tagsForTicket(ticket.id),
-    allTags: allTags(),
-    cannedResponses: canned.forAgent(res.locals.currentAgent),
-    departmentName: departments.get(departments.departmentIdForCategory(ticket.category))?.name || null,
-    // Only actually rendered for an admin (see the "Transfer to another
-    // department" card in views/dashboard/ticket.ejs), but cheap enough to
-    // just always compute here rather than branch on is_admin twice.
-    categoriesByDepartment: departments.categoriesByDepartment(),
-    rating,
-    otherTickets,
-    linkedTickets,
-    asset: ticket.asset_id ? assets.get(ticket.asset_id) : null,
-    assignableAssets: assets.assignable(),
-    statuses: STATUSES,
-    priorities: PRIORITIES,
-    requiresApproval: departments.categoryRequiresApproval(ticket.category),
-    uploadHint: LIMITS_HINT,
-    noteError: null,
-    mergedFrom: req.query.merged_from ? parseInt(req.query.merged_from, 10) : null,
-    possibleDuplicates: ["Open", "In Progress"].includes(ticket.status) ? findPossibleDuplicates(res.locals.currentAgent, ticket) : [],
-    kbArticles: kb.publishedList().map((a) => ({ ...a, url: `${req.protocol}://${req.get("host")}/kb/${a.slug}` })),
-    customFieldValues: customFields.valuesForTicket(ticket.id),
-    timeEntries: timeEntries.forTicket(ticket.id),
-    totalTimeMinutes: timeEntries.totalMinutesForTicket(ticket.id),
-    formatMinutes: timeEntries.formatMinutes,
-    todayDate: timeEntries.today(),
-    watchers: db
+    const result = await db
       .prepare(
-        `SELECT agents.id, agents.name FROM ticket_watchers
-         JOIN agents ON agents.id = ticket_watchers.agent_id
-         WHERE ticket_watchers.ticket_id = ? ORDER BY agents.name`
+        `INSERT INTO tickets (subject, description, category, subcategory, priority, requester_name, requester_email, assigned_to, asset_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .all(ticket.id),
-    isWatching: Boolean(
-      db.prepare("SELECT 1 FROM ticket_watchers WHERE ticket_id = ? AND agent_id = ?").get(ticket.id, req.session.agentId)
-    ),
-    requesterProfile,
-  });
+      .run(
+        subject.trim(),
+        description.trim(),
+        category,
+        subcategory.trim().slice(0, 100) || null,
+        priority,
+        requester_name.trim(),
+        requester_email.trim().toLowerCase(),
+        assignedTo,
+        assetId
+      );
+
+    const creatingAgent = await db.prepare("SELECT name FROM agents WHERE id = ?").get(req.session.agentId);
+    await db
+      .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`)
+      .run(result.lastInsertRowid, req.session.agentId, `Created by ${creatingAgent.name} on behalf of ${requester_name.trim()}.`);
+    await customFields.saveSubmittedCustomFields(result.lastInsertRowid, category, req.body);
+    if (assignedTo) {
+      const label = (await db.prepare("SELECT name FROM agents WHERE id = ?").get(assignedTo)).name;
+      await db
+        .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'assignment', ?)`)
+        .run(result.lastInsertRowid, req.session.agentId, `Assigned to ${label}.`);
+    }
+    if (req.files && req.files.length) {
+      await saveAttachments({ ticketId: result.lastInsertRowid, files: req.files, uploadedBy: "agent", agentId: req.session.agentId });
+    }
+
+    // Onboarding-checklist spawns (see src/checklists.js) - only when this
+    // ticket was actually created FROM that exact template, for that
+    // template's own category (not just any request that happens to carry a
+    // template_id field): template_id round-trips through the new-ticket
+    // form as a hidden input set only by the ?template= prefill, and
+    // category was already validated above against categoryNamesForAgent(),
+    // so tying the spawn to "template.category === the category just used"
+    // means this can't be used to wire up spawns the agent didn't actually
+    // ask for by picking that template.
+    const templateId = template_id ? parseInt(template_id, 10) : null;
+    if (templateId) {
+      const template = await db.prepare("SELECT * FROM ticket_templates WHERE id = ?").get(templateId);
+      if (template && template.category === category) {
+        await checklists.applyTemplateSpawns({
+          templateId,
+          originTicket: {
+            id: result.lastInsertRowid,
+            subject: subject.trim(),
+            requester_name: requester_name.trim(),
+            requester_email: requester_email.trim().toLowerCase(),
+          },
+          agentId: req.session.agentId,
+        });
+      }
+    }
+
+    sendTicketCreatedEmail({
+      to: requester_email.trim().toLowerCase(),
+      ticketId: result.lastInsertRowid,
+      subject: subject.trim(),
+    }).catch((err) => console.error("Could not send ticket-created email:", err.message));
+    await triggerWebhooks(
+      "ticket.created",
+      {
+        ticket_id: result.lastInsertRowid,
+        subject: subject.trim(),
+        category,
+        requester_email: requester_email.trim().toLowerCase(),
+      },
+      await departments.departmentIdForCategory(category)
+    );
+
+    res.redirect(`/dashboard/tickets/${result.lastInsertRowid}`);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/tickets/:id", async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
+
+    // A merged-away ticket has nothing left to show on its own page - all of
+    // its activity/attachments/tags moved to the target when it was merged
+    // (see /tickets/:id/merge below). Land the agent on the actually-active
+    // ticket instead of a dead end, with a one-time banner naming where they
+    // came from.
+    if (ticket.merged_into_id) {
+      return res.redirect(`/dashboard/tickets/${ticket.merged_into_id}?merged_from=${ticket.id}`);
+    }
+
+    // LEFT JOIN, not JOIN: a 'requester_reply' row has no agent_id at all (the
+    // requester isn't an agent), and an INNER JOIN would silently drop those
+    // rows from the feed entirely instead of just showing no agent name.
+    const activity = await db
+      .prepare(
+        `SELECT ticket_activity.*, agents.name AS agent_name
+         FROM ticket_activity
+         LEFT JOIN agents ON agents.id = ticket_activity.agent_id
+         WHERE ticket_id = ?
+         ORDER BY created_at ASC`
+      )
+      .all(ticket.id);
+
+    // Agents eligible for this ticket's department (see
+    // departments.isEligibleAssignee), plus whoever it's currently assigned to
+    // even if they've since been deactivated or moved departments - otherwise
+    // the dropdown would silently reassign the ticket the moment anyone loads
+    // this page and re-submits the form without touching the select.
+    const agents = await db
+      .prepare(
+        `SELECT id, name FROM agents
+         WHERE (active = 1 AND (is_admin = 1 OR department_id = ?)) OR id = ?
+         ORDER BY name`
+      )
+      .all(await departments.departmentIdForCategory(ticket.category), ticket.assigned_to);
+    const attachments = (await attachmentsForTicket(ticket.id)).map((a) => ({
+      ...a,
+      size_label: formatSize(a.size_bytes),
+      is_previewable: SAFE_PREVIEW_TYPES.has(a.mime_type),
+    }));
+    const rating = await db.prepare("SELECT rating, comment FROM ticket_ratings WHERE ticket_id = ?").get(ticket.id);
+    // Skipped once this ticket's own data has been erased - its requester_email
+    // is now the same shared redaction placeholder every erased ticket gets,
+    // so matching on it would incorrectly group unrelated erased requesters
+    // together under "from this requester".
+    const otherTickets = ticket.data_erased_at
+      ? []
+      : await db
+          .prepare(
+            `SELECT id, subject, status, created_at FROM tickets
+             WHERE requester_email = ? AND id != ?
+             ORDER BY created_at DESC`
+          )
+          .all(ticket.requester_email, ticket.id);
+
+    const linkedTickets = await db
+      .prepare(
+        `SELECT tickets.id, tickets.subject, tickets.status FROM ticket_links
+         JOIN tickets ON tickets.id = ticket_links.linked_ticket_id
+         WHERE ticket_links.ticket_id = ?
+         ORDER BY tickets.created_at DESC`
+      )
+      .all(ticket.id);
+
+    // Skipped once this ticket's data has been erased (GDPR) - the stored
+    // requester_email is the shared redaction placeholder by then, not a
+    // real address, and looking it up would defeat the point of erasing it
+    // in the first place.
+    const requesterProfile = ticket.data_erased_at ? null : await directory.getProfile(ticket.requester_email);
+
+    const departmentIdForTicket = await departments.departmentIdForCategory(ticket.category);
+
+    res.render("dashboard/ticket", {
+      title: `Ticket #${ticket.id}`,
+      ticket,
+      activity,
+      agents,
+      attachments,
+      aging: await isAgingTicket(ticket),
+      tags: await tagsForTicket(ticket.id),
+      allTags: await allTags(),
+      cannedResponses: await canned.forAgent(res.locals.currentAgent),
+      departmentName: (await departments.get(departmentIdForTicket))?.name || null,
+      // Only actually rendered for an admin (see the "Transfer to another
+      // department" card in views/dashboard/ticket.ejs), but cheap enough to
+      // just always compute here rather than branch on is_admin twice.
+      categoriesByDepartment: await departments.categoriesByDepartment(),
+      rating,
+      otherTickets,
+      linkedTickets,
+      asset: ticket.asset_id ? await assets.get(ticket.asset_id) : null,
+      assignableAssets: await assets.assignable(),
+      statuses: STATUSES,
+      priorities: PRIORITIES,
+      requiresApproval: await departments.categoryRequiresApproval(ticket.category),
+      uploadHint: LIMITS_HINT,
+      noteError: null,
+      mergedFrom: req.query.merged_from ? parseInt(req.query.merged_from, 10) : null,
+      possibleDuplicates: ["Open", "In Progress"].includes(ticket.status) ? await findPossibleDuplicates(res.locals.currentAgent, ticket) : [],
+      kbArticles: (await kb.publishedList()).map((a) => ({ ...a, url: `${req.protocol}://${req.get("host")}/kb/${a.slug}` })),
+      customFieldValues: await customFields.valuesForTicket(ticket.id),
+      timeEntries: await timeEntries.forTicket(ticket.id),
+      totalTimeMinutes: await timeEntries.totalMinutesForTicket(ticket.id),
+      formatMinutes: timeEntries.formatMinutes,
+      todayDate: timeEntries.today(),
+      watchers: await db
+        .prepare(
+          `SELECT agents.id, agents.name FROM ticket_watchers
+           JOIN agents ON agents.id = ticket_watchers.agent_id
+           WHERE ticket_watchers.ticket_id = ? ORDER BY agents.name`
+        )
+        .all(ticket.id),
+      isWatching: Boolean(
+        await db.prepare("SELECT 1 FROM ticket_watchers WHERE ticket_id = ? AND agent_id = ?").get(ticket.id, req.session.agentId)
+      ),
+      requesterProfile,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // A small avatar for any tenant email (agent or requester), backed by
@@ -733,14 +756,18 @@ router.get("/tickets/:id", async (req, res) => {
 // ticket). 404s (not a real error page - a broken <img> just shows
 // nothing) whenever there's no photo to show, same as attachment previews
 // elsewhere quietly no-op instead of erroring.
-router.get("/directory/photo", async (req, res) => {
-  const email = (req.query.email || "").trim().toLowerCase();
-  if (!email) return res.status(404).end();
-  const photo = await directory.getPhoto(email);
-  if (!photo) return res.status(404).end();
-  res.setHeader("Content-Type", photo.contentType);
-  res.setHeader("Cache-Control", "private, max-age=3600");
-  res.send(photo.buffer);
+router.get("/directory/photo", async (req, res, next) => {
+  try {
+    const email = (req.query.email || "").trim().toLowerCase();
+    if (!email) return res.status(404).end();
+    const photo = await directory.getPhoto(email);
+    if (!photo) return res.status(404).end();
+    res.setHeader("Content-Type", photo.contentType);
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.send(photo.buffer);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Moves all activity/attachments/tags onto the target ticket, closes this
@@ -750,26 +777,30 @@ router.get("/directory/photo", async (req, res) => {
 // A print-friendly view of one ticket (details + full activity feed) - the
 // "PDF export" is just the browser's own Print / Save as PDF on this page,
 // rather than a rendering dependency in the app itself.
-router.get("/tickets/:id/print", (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.get("/tickets/:id/print", async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const activity = db
-    .prepare(
-      `SELECT ticket_activity.*, agents.name AS agent_name
-       FROM ticket_activity
-       LEFT JOIN agents ON agents.id = ticket_activity.agent_id
-       WHERE ticket_id = ?
-       ORDER BY created_at ASC`
-    )
-    .all(ticket.id);
+    const activity = await db
+      .prepare(
+        `SELECT ticket_activity.*, agents.name AS agent_name
+         FROM ticket_activity
+         LEFT JOIN agents ON agents.id = ticket_activity.agent_id
+         WHERE ticket_id = ?
+         ORDER BY created_at ASC`
+      )
+      .all(ticket.id);
 
-  res.render("dashboard/ticket-print", {
-    title: `Ticket #${ticket.id}`,
-    ticket,
-    activity,
-    asset: ticket.asset_id ? assets.get(ticket.asset_id) : null,
-  });
+    res.render("dashboard/ticket-print", {
+      title: `Ticket #${ticket.id}`,
+      ticket,
+      activity,
+      asset: ticket.asset_id ? await assets.get(ticket.asset_id) : null,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // The requester-visible half of a ticket's conversation - same query as
@@ -778,7 +809,7 @@ router.get("/tickets/:id/print", (req, res) => {
 // requester-facing activity types ('reply' and 'requester_reply'), not
 // worth a cross-module dependency between the public and dashboard routers
 // for. Used only by the view-as-requester preview below.
-function conversationForTicket(ticketId) {
+async function conversationForTicket(ticketId) {
   return db
     .prepare(
       `SELECT ticket_activity.*, agents.name AS agent_name
@@ -806,97 +837,99 @@ function conversationForTicket(ticketId) {
 // runs first (an admin always passes it, per canSeeTicket, but it's the one
 // place a bad/missing :id 404s instead of throwing). Every use is logged as
 // ticket activity so it's auditable who previewed what, and when.
-router.get("/tickets/:id/view-as-requester", requireAdmin, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.get("/tickets/:id/view-as-requester", requireAdmin, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  db.prepare(
-    `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`
-  ).run(ticket.id, req.session.agentId, `${res.locals.currentAgent.name} previewed this ticket as the requester.`);
+    await db
+      .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`)
+      .run(ticket.id, req.session.agentId, `${res.locals.currentAgent.name} previewed this ticket as the requester.`);
 
-  res.render("public/status-check", {
-    title: `Ticket #${ticket.id} - viewing as requester`,
-    ticket,
-    attachments: attachmentsForTicket(ticket.id, { requesterVisibleOnly: true }).map((a) => ({
-      ...a,
-      size_label: formatSize(a.size_bytes),
-      // Never previewable/downloadable from here - see the isPreview branch
-      // in status-check.ejs, which lists attachments as plain text in
-      // preview mode rather than wiring up the public download/preview
-      // routes (those expect a real requester-owned session/request, which
-      // this deliberately isn't).
-      is_previewable: false,
-    })),
-    conversation: conversationForTicket(ticket.id),
-    error: null,
-    mergedNotice: null,
-    requester: { name: ticket.requester_name, email: ticket.requester_email },
-    preview: true,
-    previewBackUrl: `/dashboard/tickets/${ticket.id}`,
-  });
+    res.render("public/status-check", {
+      title: `Ticket #${ticket.id} - viewing as requester`,
+      ticket,
+      attachments: (await attachmentsForTicket(ticket.id, { requesterVisibleOnly: true })).map((a) => ({
+        ...a,
+        size_label: formatSize(a.size_bytes),
+        // Never previewable/downloadable from here - see the isPreview branch
+        // in status-check.ejs, which lists attachments as plain text in
+        // preview mode rather than wiring up the public download/preview
+        // routes (those expect a real requester-owned session/request, which
+        // this deliberately isn't).
+        is_previewable: false,
+      })),
+      conversation: await conversationForTicket(ticket.id),
+      error: null,
+      mergedNotice: null,
+      requester: { name: ticket.requester_name, email: ticket.requester_email },
+      preview: true,
+      previewBackUrl: `/dashboard/tickets/${ticket.id}`,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/tickets/:id/merge", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
-
-  const targetId = parseInt(req.body.target_ticket_id, 10);
-  if (!targetId || targetId === ticket.id) {
-    return res.status(400).render("error", { title: "Invalid merge", message: "Enter a different, valid ticket number to merge into." });
-  }
-  if (ticket.merged_into_id) {
-    return res.status(400).render("error", { title: "Invalid merge", message: "This ticket has already been merged." });
-  }
-  // Same visibility rule as fetching any other ticket by id - a target the
-  // agent can't otherwise see 404/400s exactly like one that doesn't exist,
-  // rather than confirming its existence to someone outside its department.
-  const target = db.prepare("SELECT * FROM tickets WHERE id = ?").get(targetId);
-  if (!target || !departments.canSeeTicket(res.locals.currentAgent, target)) {
-    return res.status(400).render("error", { title: "Invalid merge", message: "That target ticket does not exist." });
-  }
-  if (target.merged_into_id) {
-    return res.status(400).render("error", {
-      title: "Invalid merge",
-      message: "That target ticket has itself been merged elsewhere - merge into its final destination instead.",
-    });
-  }
-  // Merging moves a ticket's whole activity/attachment/tag history onto the
-  // target - across departments that would either strand the result with no
-  // clear department owner, or (worse) quietly move one department's
-  // conversation into another's. Disallowed outright, even for an admin:
-  // use the existing "Link" feature instead for tickets that are genuinely
-  // related but shouldn't become one.
-  if (departments.departmentIdForCategory(ticket.category) !== departments.departmentIdForCategory(target.category)) {
-    return res.status(400).render("error", {
-      title: "Invalid merge",
-      message: "Tickets from different departments can't be merged into each other. Use \"Link\" instead if they're related.",
-    });
-  }
-
-  db.exec("BEGIN");
+router.post("/tickets/:id/merge", verifyCsrf, async (req, res, next) => {
   try {
-    db.prepare("UPDATE ticket_activity SET ticket_id = ? WHERE ticket_id = ?").run(target.id, ticket.id);
-    db.prepare("UPDATE attachments SET ticket_id = ? WHERE ticket_id = ?").run(target.id, ticket.id);
-    db.prepare(
-      "INSERT OR IGNORE INTO ticket_tags (ticket_id, tag_id) SELECT ?, tag_id FROM ticket_tags WHERE ticket_id = ?"
-    ).run(target.id, ticket.id);
-    db.prepare("DELETE FROM ticket_tags WHERE ticket_id = ?").run(ticket.id);
-    db.prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`).run(
-      target.id,
-      req.session.agentId,
-      `Merged ticket #${ticket.id} ("${ticket.subject}") into this one.`
-    );
-    db.prepare(
-      "UPDATE tickets SET merged_into_id = ?, status = 'Closed', updated_at = datetime('now') WHERE id = ?"
-    ).run(target.id, ticket.id);
-    db.prepare("UPDATE tickets SET updated_at = datetime('now') WHERE id = ?").run(target.id);
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  res.redirect(`/dashboard/tickets/${target.id}`);
+    const targetId = parseInt(req.body.target_ticket_id, 10);
+    if (!targetId || targetId === ticket.id) {
+      return res.status(400).render("error", { title: "Invalid merge", message: "Enter a different, valid ticket number to merge into." });
+    }
+    if (ticket.merged_into_id) {
+      return res.status(400).render("error", { title: "Invalid merge", message: "This ticket has already been merged." });
+    }
+    // Same visibility rule as fetching any other ticket by id - a target the
+    // agent can't otherwise see 404/400s exactly like one that doesn't exist,
+    // rather than confirming its existence to someone outside its department.
+    const target = await db.prepare("SELECT * FROM tickets WHERE id = ?").get(targetId);
+    if (!target || !(await departments.canSeeTicket(res.locals.currentAgent, target))) {
+      return res.status(400).render("error", { title: "Invalid merge", message: "That target ticket does not exist." });
+    }
+    if (target.merged_into_id) {
+      return res.status(400).render("error", {
+        title: "Invalid merge",
+        message: "That target ticket has itself been merged elsewhere - merge into its final destination instead.",
+      });
+    }
+    // Merging moves a ticket's whole activity/attachment/tag history onto the
+    // target - across departments that would either strand the result with no
+    // clear department owner, or (worse) quietly move one department's
+    // conversation into another's. Disallowed outright, even for an admin:
+    // use the existing "Link" feature instead for tickets that are genuinely
+    // related but shouldn't become one.
+    if ((await departments.departmentIdForCategory(ticket.category)) !== (await departments.departmentIdForCategory(target.category))) {
+      return res.status(400).render("error", {
+        title: "Invalid merge",
+        message: "Tickets from different departments can't be merged into each other. Use \"Link\" instead if they're related.",
+      });
+    }
+
+    // node:sqlite's synchronous db.exec("BEGIN")/COMMIT/ROLLBACK isn't safely
+    // atomic against a connection pool (see db/index.js's transaction() doc
+    // comment) - this now checks out one client for the whole sequence.
+    await db.transaction(async (tx) => {
+      await tx.prepare("UPDATE ticket_activity SET ticket_id = ? WHERE ticket_id = ?").run(target.id, ticket.id);
+      await tx.prepare("UPDATE attachments SET ticket_id = ? WHERE ticket_id = ?").run(target.id, ticket.id);
+      await tx
+        .prepare("INSERT INTO ticket_tags (ticket_id, tag_id) SELECT ?, tag_id FROM ticket_tags WHERE ticket_id = ? ON CONFLICT (ticket_id, tag_id) DO NOTHING")
+        .run(target.id, ticket.id);
+      await tx.prepare("DELETE FROM ticket_tags WHERE ticket_id = ?").run(ticket.id);
+      await tx
+        .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`)
+        .run(target.id, req.session.agentId, `Merged ticket #${ticket.id} ("${ticket.subject}") into this one.`);
+      await tx.prepare("UPDATE tickets SET merged_into_id = ?, status = 'Closed', updated_at = now_text() WHERE id = ?").run(target.id, ticket.id);
+      await tx.prepare("UPDATE tickets SET updated_at = now_text() WHERE id = ?").run(target.id);
+    });
+
+    res.redirect(`/dashboard/tickets/${target.id}`);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Manually link two genuinely separate tickets that are still connected
@@ -904,144 +937,192 @@ router.post("/tickets/:id/merge", verifyCsrf, (req, res) => {
 // Stored symmetrically (see src/db/index.js's ticket_links comment) so
 // either ticket's own page shows the link without an OR-across-both-columns
 // query.
-router.post("/tickets/:id/link", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/link", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const otherId = parseInt(req.body.linked_ticket_id, 10);
-  if (!otherId || otherId === ticket.id) {
-    return res.status(400).render("error", { title: "Invalid link", message: "Enter a different, valid ticket number to link to." });
+    const otherId = parseInt(req.body.linked_ticket_id, 10);
+    if (!otherId || otherId === ticket.id) {
+      return res.status(400).render("error", { title: "Invalid link", message: "Enter a different, valid ticket number to link to." });
+    }
+    const other = await getTicketOr404(req, res, otherId);
+    if (!other) return;
+
+    await db.prepare("INSERT INTO ticket_links (ticket_id, linked_ticket_id) VALUES (?, ?) ON CONFLICT (ticket_id, linked_ticket_id) DO NOTHING").run(ticket.id, other.id);
+    await db.prepare("INSERT INTO ticket_links (ticket_id, linked_ticket_id) VALUES (?, ?) ON CONFLICT (ticket_id, linked_ticket_id) DO NOTHING").run(other.id, ticket.id);
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
   }
-  const other = getTicketOr404(req, res, otherId);
-  if (!other) return;
-
-  db.prepare("INSERT OR IGNORE INTO ticket_links (ticket_id, linked_ticket_id) VALUES (?, ?)").run(ticket.id, other.id);
-  db.prepare("INSERT OR IGNORE INTO ticket_links (ticket_id, linked_ticket_id) VALUES (?, ?)").run(other.id, ticket.id);
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
 });
 
-router.post("/tickets/:id/link/:linkedId/remove", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/link/:linkedId/remove", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const otherId = parseInt(req.params.linkedId, 10);
-  db.prepare("DELETE FROM ticket_links WHERE ticket_id = ? AND linked_ticket_id = ?").run(ticket.id, otherId);
-  db.prepare("DELETE FROM ticket_links WHERE ticket_id = ? AND linked_ticket_id = ?").run(otherId, ticket.id);
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
+    const otherId = parseInt(req.params.linkedId, 10);
+    await db.prepare("DELETE FROM ticket_links WHERE ticket_id = ? AND linked_ticket_id = ?").run(ticket.id, otherId);
+    await db.prepare("DELETE FROM ticket_links WHERE ticket_id = ? AND linked_ticket_id = ?").run(otherId, ticket.id);
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Agent-side inline preview for a safe image attachment - never PDF/TXT/CSV,
 // see SAFE_PREVIEW_TYPES. Everything else still only ever force-downloads.
-router.get("/tickets/:id/attachments/:attachmentId/preview", (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.get("/tickets/:id/attachments/:attachmentId/preview", async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const attachment = getAttachment(ticket.id, req.params.attachmentId);
-  if (!attachment || !SAFE_PREVIEW_TYPES.has(attachment.mime_type)) {
-    return res.status(404).render("error", { title: "Not found", message: "No preview is available for that attachment." });
+    const attachment = await getAttachment(ticket.id, req.params.attachmentId);
+    if (!attachment || !SAFE_PREVIEW_TYPES.has(attachment.mime_type)) {
+      return res.status(404).render("error", { title: "Not found", message: "No preview is available for that attachment." });
+    }
+    res.setHeader("Content-Type", attachment.mime_type);
+    res.setHeader("Content-Disposition", "inline");
+    res.sendFile(path.join(ATTACHMENTS_DIR, attachment.stored_name));
+  } catch (err) {
+    next(err);
   }
-  res.setHeader("Content-Type", attachment.mime_type);
-  res.setHeader("Content-Disposition", "inline");
-  res.sendFile(path.join(ATTACHMENTS_DIR, attachment.stored_name));
 });
 
 // GDPR export/erasure, scoped to this ticket's requester email and reachable
 // from the ticket detail page's "Requester data" card - there's no requester
 // login system in this app, so both are agent-initiated, not self-service.
-router.get("/tickets/:id/privacy/export.json", (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.get("/tickets/:id/privacy/export.json", async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const bundle = exportRequesterData(ticket.requester_email);
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="requester-data-${ticket.id}-${Date.now()}.json"`);
-  res.send(JSON.stringify(bundle, null, 2));
+    const bundle = await exportRequesterData(ticket.requester_email);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="requester-data-${ticket.id}-${Date.now()}.json"`);
+    res.send(JSON.stringify(bundle, null, 2));
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/tickets/:id/privacy/erase", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/privacy/erase", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const result = eraseRequesterData(ticket.requester_email);
-  if (result.error) {
-    return res.status(400).render("error", { title: "Erasure failed", message: result.error });
+    const result = await eraseRequesterData(ticket.requester_email);
+    if (result.error) {
+      return res.status(400).render("error", { title: "Erasure failed", message: result.error });
+    }
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
   }
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
 });
 
-router.post("/tickets/:id/asset", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/asset", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const raw = req.body.asset_id;
-  const newAssetId = raw ? parseInt(raw, 10) : null;
-  if (newAssetId && !assets.get(newAssetId)) {
-    return res.status(400).render("error", { title: "Invalid asset", message: "That asset does not exist." });
+    const raw = req.body.asset_id;
+    const newAssetId = raw ? parseInt(raw, 10) : null;
+    if (newAssetId && !(await assets.get(newAssetId))) {
+      return res.status(400).render("error", { title: "Invalid asset", message: "That asset does not exist." });
+    }
+
+    await db.prepare("UPDATE tickets SET asset_id = ?, updated_at = now_text() WHERE id = ?").run(newAssetId, ticket.id);
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
   }
-
-  db.prepare("UPDATE tickets SET asset_id = ?, updated_at = datetime('now') WHERE id = ?").run(newAssetId, ticket.id);
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
 });
 
 // A watcher gets notified alongside the assignee (see sendAgentNotifiedOfReply
 // in public.js's /status/reply) without being the assignee themselves -
 // "keep me posted" without reassigning it away from whoever's actually
 // working it.
-router.post("/tickets/:id/watch", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
-  db.prepare("INSERT OR IGNORE INTO ticket_watchers (ticket_id, agent_id) VALUES (?, ?)").run(ticket.id, req.session.agentId);
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
-});
-
-router.post("/tickets/:id/unwatch", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
-  db.prepare("DELETE FROM ticket_watchers WHERE ticket_id = ? AND agent_id = ?").run(ticket.id, req.session.agentId);
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
-});
-
-router.post("/tickets/:id/tags", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
-
-  if ((req.body.tag || "").trim()) {
-    addTagToTicket(ticket.id, req.body.tag);
-    db.prepare("UPDATE tickets SET updated_at = datetime('now') WHERE id = ?").run(ticket.id);
+router.post("/tickets/:id/watch", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
+    await db.prepare("INSERT INTO ticket_watchers (ticket_id, agent_id) VALUES (?, ?) ON CONFLICT (ticket_id, agent_id) DO NOTHING").run(ticket.id, req.session.agentId);
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
   }
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
 });
 
-router.post("/tickets/:id/tags/:tagId/remove", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/unwatch", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
+    await db.prepare("DELETE FROM ticket_watchers WHERE ticket_id = ? AND agent_id = ?").run(ticket.id, req.session.agentId);
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
+  }
+});
 
-  removeTagFromTicket(ticket.id, req.params.tagId);
-  db.prepare("UPDATE tickets SET updated_at = datetime('now') WHERE id = ?").run(ticket.id);
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
+router.post("/tickets/:id/tags", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
+
+    if ((req.body.tag || "").trim()) {
+      await addTagToTicket(ticket.id, req.body.tag);
+      await db.prepare("UPDATE tickets SET updated_at = now_text() WHERE id = ?").run(ticket.id);
+    }
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/tickets/:id/tags/:tagId/remove", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
+
+    await removeTagFromTicket(ticket.id, req.params.tagId);
+    await db.prepare("UPDATE tickets SET updated_at = now_text() WHERE id = ?").run(ticket.id);
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Manual time logging (see src/time-entries.js) - a whole-day+ or non-numeric
 // minutes value is rejected outright rather than silently clamped, same
 // "surprising input gets an error page, not a silent guess" call as the
 // /link route's invalid ticket number above.
-router.post("/tickets/:id/time", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/time", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const result = timeEntries.create(ticket.id, req.session.agentId, req.body);
-  if (result.error) {
-    return res.status(400).render("error", { title: "Invalid time entry", message: result.error });
+    const result = await timeEntries.create(ticket.id, req.session.agentId, req.body);
+    if (result.error) {
+      return res.status(400).render("error", { title: "Invalid time entry", message: result.error });
+    }
+    res.redirect(`/dashboard/tickets/${ticket.id}#time`);
+  } catch (err) {
+    next(err);
   }
-  res.redirect(`/dashboard/tickets/${ticket.id}#time`);
 });
 
-router.post("/tickets/:id/time/:entryId/delete", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/time/:entryId/delete", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  timeEntries.remove(ticket.id, req.params.entryId);
-  res.redirect(`/dashboard/tickets/${ticket.id}#time`);
+    await timeEntries.remove(ticket.id, req.params.entryId);
+    res.redirect(`/dashboard/tickets/${ticket.id}#time`);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // The generic approval gate (see src/departments.js's categoryRequiresApproval
@@ -1053,20 +1134,18 @@ router.post("/tickets/:id/time/:entryId/delete", verifyCsrf, (req, res) => {
 // hierarchy to hang approval on, so is_admin is it) approves or rejects.
 // Idempotent: resubmitting while already pending is a no-op, so hammering
 // the "Closed" option in the status dropdown doesn't spam the activity feed.
-function submitForApproval(ticket, agentId) {
+async function submitForApproval(ticket, agentId) {
   if (ticket.approval_status === "pending") return;
-  db.prepare(
-    "UPDATE tickets SET approval_status = 'pending', approval_note = NULL, updated_at = datetime('now') WHERE id = ?"
-  ).run(ticket.id);
-  db.prepare(
-    `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'approval_change', ?)`
-  ).run(ticket.id, agentId, "Submitted for approval before closing - this category requires an admin's sign-off.");
+  await db.prepare("UPDATE tickets SET approval_status = 'pending', approval_note = NULL, updated_at = now_text() WHERE id = ?").run(ticket.id);
+  await db
+    .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'approval_change', ?)`)
+    .run(ticket.id, agentId, "Submitted for approval before closing - this category requires an admin's sign-off.");
 }
 
 // Shared by the single-ticket status route and the bulk-status route below,
 // so the two can never quietly diverge on what "changing status" means
 // (activity logging, the rating-token/email side effects on Resolved, etc).
-function applyStatusChange(ticket, status, agentId) {
+async function applyStatusChange(ticket, status, agentId) {
   if (!STATUSES.includes(status) || status === ticket.status) return;
 
   // A category flagged as requiring approval can't be closed directly -
@@ -1075,8 +1154,8 @@ function applyStatusChange(ticket, status, agentId) {
   // this same function with approval_status already 'approved' on the
   // ticket it passes in, so that path falls straight through to the normal
   // close below rather than looping back into another pending request.
-  if (status === "Closed" && ticket.approval_status !== "approved" && departments.categoryRequiresApproval(ticket.category)) {
-    submitForApproval(ticket, agentId);
+  if (status === "Closed" && ticket.approval_status !== "approved" && (await departments.categoryRequiresApproval(ticket.category))) {
+    await submitForApproval(ticket, agentId);
     return;
   }
 
@@ -1097,19 +1176,21 @@ function applyStatusChange(ticket, status, agentId) {
   let pauseSql = "";
   const pauseParams = [];
   if (status === "Waiting on Customer") {
-    pauseSql = ", waiting_since = datetime('now')";
+    pauseSql = ", waiting_since = now_text()";
   } else if (ticket.status === "Waiting on Customer" && ticket.waiting_since) {
     const waitingSince = new Date(`${ticket.waiting_since.replace(" ", "T")}Z`);
     pauseSql = ", waiting_since = NULL, paused_hours = paused_hours + ?";
-    pauseParams.push(businessHoursElapsed(waitingSince, new Date()));
+    pauseParams.push(await businessHoursElapsed(waitingSince, new Date()));
   }
 
-  db.prepare(
-    `UPDATE tickets SET status = ?, updated_at = datetime('now')${reopening ? ", sla_alerted_at = NULL" : ""}${approvalResetSql}${pauseSql} WHERE id = ?`
-  ).run(status, ...pauseParams, ticket.id);
-  db.prepare(
-    `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'status_change', ?)`
-  ).run(ticket.id, agentId, `Status changed from "${ticket.status}" to "${status}".`);
+  await db
+    .prepare(
+      `UPDATE tickets SET status = ?, updated_at = now_text()${reopening ? ", sla_alerted_at = NULL" : ""}${approvalResetSql}${pauseSql} WHERE id = ?`
+    )
+    .run(status, ...pauseParams, ticket.id);
+  await db
+    .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'status_change', ?)`)
+    .run(ticket.id, agentId, `Status changed from "${ticket.status}" to "${status}".`);
 
   if (status === "Resolved") {
     // Generated lazily, once, the first time a ticket actually resolves -
@@ -1119,7 +1200,7 @@ function applyStatusChange(ticket, status, agentId) {
     let ratingToken = ticket.rating_token;
     if (!ratingToken) {
       ratingToken = crypto.randomBytes(24).toString("hex");
-      db.prepare("UPDATE tickets SET rating_token = ? WHERE id = ?").run(ratingToken, ticket.id);
+      await db.prepare("UPDATE tickets SET rating_token = ? WHERE id = ?").run(ratingToken, ticket.id);
     }
     sendResolvedEmail({
       to: ticket.requester_email,
@@ -1138,7 +1219,7 @@ function applyStatusChange(ticket, status, agentId) {
     }).catch((err) => console.error("Could not send status-change email:", err.message));
   }
 
-  triggerWebhooks(
+  await triggerWebhooks(
     "ticket.status_changed",
     {
       ticket_id: ticket.id,
@@ -1146,19 +1227,23 @@ function applyStatusChange(ticket, status, agentId) {
       old_status: ticket.status,
       new_status: status,
     },
-    departments.departmentIdForCategory(ticket.category)
+    await departments.departmentIdForCategory(ticket.category)
   );
 }
 
-router.post("/tickets/:id/status", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/status", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  if (!STATUSES.includes(req.body.status)) {
-    return res.status(400).render("error", { title: "Invalid status", message: "That status is not valid." });
+    if (!STATUSES.includes(req.body.status)) {
+      return res.status(400).render("error", { title: "Invalid status", message: "That status is not valid." });
+    }
+    await applyStatusChange(ticket, req.body.status, req.session.agentId);
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
   }
-  applyStatusChange(ticket, req.body.status, req.session.agentId);
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
 });
 
 // Approve/reject a ticket parked in the pending-approval gate (see
@@ -1168,72 +1253,83 @@ router.post("/tickets/:id/status", verifyCsrf, (req, res) => {
 // is who can approve, full stop. Neither route is reachable for a ticket
 // that isn't actually pending, so there's no path to approve/reject a
 // decision that was never asked for.
-router.post("/tickets/:id/approval/approve", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
-  if (!res.locals.currentAgent.is_admin) {
-    return res.status(403).render("error", { title: "Admins only", message: "You need admin access to approve or reject a ticket." });
-  }
-  if (ticket.approval_status !== "pending") {
-    return res.status(400).render("error", { title: "Nothing to approve", message: "This ticket isn't waiting on an approval decision." });
-  }
+router.post("/tickets/:id/approval/approve", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
+    if (!res.locals.currentAgent.is_admin) {
+      return res.status(403).render("error", { title: "Admins only", message: "You need admin access to approve or reject a ticket." });
+    }
+    if (ticket.approval_status !== "pending") {
+      return res.status(400).render("error", { title: "Nothing to approve", message: "This ticket isn't waiting on an approval decision." });
+    }
 
-  db.prepare("UPDATE tickets SET approval_status = 'approved', approval_note = NULL WHERE id = ?").run(ticket.id);
-  db.prepare(
-    `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'approval_change', ?)`
-  ).run(ticket.id, req.session.agentId, "Approved for closing.");
-  // Reuses the normal close path (activity log, resolved/status-change email,
-  // webhooks) for the actual status flip - approval_status is already
-  // 'approved' on this in-memory copy, so applyStatusChange's own gate check
-  // falls through instead of looping back into another pending request.
-  applyStatusChange({ ...ticket, approval_status: "approved" }, "Closed", req.session.agentId);
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
+    await db.prepare("UPDATE tickets SET approval_status = 'approved', approval_note = NULL WHERE id = ?").run(ticket.id);
+    await db
+      .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'approval_change', ?)`)
+      .run(ticket.id, req.session.agentId, "Approved for closing.");
+    // Reuses the normal close path (activity log, resolved/status-change email,
+    // webhooks) for the actual status flip - approval_status is already
+    // 'approved' on this in-memory copy, so applyStatusChange's own gate check
+    // falls through instead of looping back into another pending request.
+    await applyStatusChange({ ...ticket, approval_status: "approved" }, "Closed", req.session.agentId);
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/tickets/:id/approval/reject", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
-  if (!res.locals.currentAgent.is_admin) {
-    return res.status(403).render("error", { title: "Admins only", message: "You need admin access to approve or reject a ticket." });
-  }
-  if (ticket.approval_status !== "pending") {
-    return res.status(400).render("error", { title: "Nothing to reject", message: "This ticket isn't waiting on an approval decision." });
-  }
+router.post("/tickets/:id/approval/reject", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
+    if (!res.locals.currentAgent.is_admin) {
+      return res.status(403).render("error", { title: "Admins only", message: "You need admin access to approve or reject a ticket." });
+    }
+    if (ticket.approval_status !== "pending") {
+      return res.status(400).render("error", { title: "Nothing to reject", message: "This ticket isn't waiting on an approval decision." });
+    }
 
-  // The reviewer note is optional and generic (any category can use it, not
-  // just Marketing's content-review flow this was built for) - shown back to
-  // the assignee on the ticket page so they know what to fix before
-  // resubmitting (selecting "Closed" again re-enters the pending gate).
-  const note = (req.body.note || "").trim().slice(0, 1000) || null;
-  db.prepare("UPDATE tickets SET approval_status = 'rejected', approval_note = ?, updated_at = datetime('now') WHERE id = ?").run(
-    note,
-    ticket.id
-  );
-  db.prepare(
-    `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'approval_change', ?)`
-  ).run(ticket.id, req.session.agentId, note ? `Rejected - not ready to close. Reviewer note: ${note}` : "Rejected - not ready to close.");
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
+    // The reviewer note is optional and generic (any category can use it, not
+    // just Marketing's content-review flow this was built for) - shown back to
+    // the assignee on the ticket page so they know what to fix before
+    // resubmitting (selecting "Closed" again re-enters the pending gate).
+    const note = (req.body.note || "").trim().slice(0, 1000) || null;
+    await db
+      .prepare("UPDATE tickets SET approval_status = 'rejected', approval_note = ?, updated_at = now_text() WHERE id = ?")
+      .run(note, ticket.id);
+    await db
+      .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'approval_change', ?)`)
+      .run(ticket.id, req.session.agentId, note ? `Rejected - not ready to close. Reviewer note: ${note}` : "Rejected - not ready to close.");
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Priority is set by the helpdesk team, not the requester - the public
 // request form has no priority field at all (see src/routes/public.js).
-router.post("/tickets/:id/priority", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/priority", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const { priority } = req.body;
-  if (!PRIORITIES.includes(priority)) {
-    return res.status(400).render("error", { title: "Invalid priority", message: "That priority is not valid." });
+    const { priority } = req.body;
+    if (!PRIORITIES.includes(priority)) {
+      return res.status(400).render("error", { title: "Invalid priority", message: "That priority is not valid." });
+    }
+
+    if (priority !== ticket.priority) {
+      await db.prepare("UPDATE tickets SET priority = ?, updated_at = now_text() WHERE id = ?").run(priority, ticket.id);
+      await db
+        .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'priority_change', ?)`)
+        .run(ticket.id, req.session.agentId, `Priority changed from "${ticket.priority}" to "${priority}".`);
+    }
+
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
   }
-
-  if (priority !== ticket.priority) {
-    db.prepare("UPDATE tickets SET priority = ?, updated_at = datetime('now') WHERE id = ?").run(priority, ticket.id);
-    db.prepare(
-      `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'priority_change', ?)`
-    ).run(ticket.id, req.session.agentId, `Priority changed from "${ticket.priority}" to "${priority}".`);
-  }
-
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
 });
 
 // A confidential ticket is hidden from every same-department agent except
@@ -1243,23 +1339,27 @@ router.post("/tickets/:id/priority", verifyCsrf, (req, res) => {
 // invisible regardless of this flag. Toggleable by anyone who can currently
 // see the ticket (same "no extra permission tier" model the rest of this
 // app already uses for e.g. status/priority).
-router.post("/tickets/:id/confidential", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/confidential", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const confidential = req.body.confidential ? 1 : 0;
-  if (confidential !== ticket.confidential) {
-    db.prepare("UPDATE tickets SET confidential = ?, updated_at = datetime('now') WHERE id = ?").run(confidential, ticket.id);
-    db.prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`).run(
-      ticket.id,
-      req.session.agentId,
-      confidential
-        ? "Marked confidential - only the assigned agent and admins can see this ticket."
-        : "Removed the confidential flag."
-    );
+    const confidential = req.body.confidential ? 1 : 0;
+    if (confidential !== ticket.confidential) {
+      await db.prepare("UPDATE tickets SET confidential = ?, updated_at = now_text() WHERE id = ?").run(confidential, ticket.id);
+      await db
+        .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`)
+        .run(
+          ticket.id,
+          req.session.agentId,
+          confidential ? "Marked confidential - only the assigned agent and admins can see this ticket." : "Removed the confidential flag."
+        );
+    }
+
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
   }
-
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
 });
 
 // Moves a misfiled ticket across the strict department boundary by changing
@@ -1272,55 +1372,56 @@ router.post("/tickets/:id/confidential", verifyCsrf, (req, res) => {
 // the ticket. Immediately removes the ticket from the sending department's
 // queue and puts it in the target's, per departments.canSeeTicket's strict
 // department match - that's the intended effect of a transfer, not a bug.
-router.post("/tickets/:id/transfer", requireAdmin, verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
-
-  const category = (req.body.category || "").trim();
-  if (!departments.isValidCategoryName(category)) {
-    return res.status(400).render("error", { title: "Invalid category", message: "Choose a valid category to transfer into." });
-  }
-  if (category === ticket.category) {
-    // Picked the ticket's own current category - nothing to do.
-    return res.redirect(`/dashboard/tickets/${ticket.id}`);
-  }
-
-  const fromDept = departments.get(departments.departmentIdForCategory(ticket.category));
-  const toDept = departments.get(departments.departmentIdForCategory(category));
-  const actingAgent = db.prepare("SELECT name FROM agents WHERE id = ?").get(req.session.agentId);
-
-  // The current assignee (if any) may not belong to the target department -
-  // same "only agents in that category's department are eligible" rule
-  // applied everywhere else an assignment happens (departments.
-  // isEligibleAssignee). Rather than leave a stale cross-department
-  // assignment in place, unassign it here - otherwise a confidential
-  // ticket transferred this way could end up visible to nobody in the
-  // receiving department at all (confidential narrows visibility to the
-  // assignee, who'd now be outside it - see departments.canSeeTicket).
-  let unassigned = false;
-  if (ticket.assigned_to) {
-    const assignee = db.prepare("SELECT id, department_id, is_admin FROM agents WHERE id = ?").get(ticket.assigned_to);
-    if (!departments.isEligibleAssignee(assignee, category)) unassigned = true;
-  }
-
-  db.exec("BEGIN");
+router.post("/tickets/:id/transfer", requireAdmin, verifyCsrf, async (req, res, next) => {
   try {
-    db.prepare(
-      `UPDATE tickets SET category = ?${unassigned ? ", assigned_to = NULL" : ""}, updated_at = datetime('now') WHERE id = ?`
-    ).run(category, ticket.id);
-    db.prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`).run(
-      ticket.id,
-      req.session.agentId,
-      `Transferred from ${fromDept ? fromDept.name : "an unknown department"} to ${toDept ? toDept.name : "an unknown department"} by ${actingAgent.name}.` +
-        (unassigned ? " Unassigned, since the previous assignee is not in the new department." : "")
-    );
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
+    const category = (req.body.category || "").trim();
+    if (!(await departments.isValidCategoryName(category))) {
+      return res.status(400).render("error", { title: "Invalid category", message: "Choose a valid category to transfer into." });
+    }
+    if (category === ticket.category) {
+      // Picked the ticket's own current category - nothing to do.
+      return res.redirect(`/dashboard/tickets/${ticket.id}`);
+    }
+
+    const fromDept = await departments.get(await departments.departmentIdForCategory(ticket.category));
+    const toDept = await departments.get(await departments.departmentIdForCategory(category));
+    const actingAgent = await db.prepare("SELECT name FROM agents WHERE id = ?").get(req.session.agentId);
+
+    // The current assignee (if any) may not belong to the target department -
+    // same "only agents in that category's department are eligible" rule
+    // applied everywhere else an assignment happens (departments.
+    // isEligibleAssignee). Rather than leave a stale cross-department
+    // assignment in place, unassign it here - otherwise a confidential
+    // ticket transferred this way could end up visible to nobody in the
+    // receiving department at all (confidential narrows visibility to the
+    // assignee, who'd now be outside it - see departments.canSeeTicket).
+    let unassigned = false;
+    if (ticket.assigned_to) {
+      const assignee = await db.prepare("SELECT id, department_id, is_admin FROM agents WHERE id = ?").get(ticket.assigned_to);
+      if (!(await departments.isEligibleAssignee(assignee, category))) unassigned = true;
+    }
+
+    await db.transaction(async (tx) => {
+      await tx
+        .prepare(`UPDATE tickets SET category = ?${unassigned ? ", assigned_to = NULL" : ""}, updated_at = now_text() WHERE id = ?`)
+        .run(category, ticket.id);
+      await tx
+        .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`)
+        .run(
+          ticket.id,
+          req.session.agentId,
+          `Transferred from ${fromDept ? fromDept.name : "an unknown department"} to ${toDept ? toDept.name : "an unknown department"} by ${actingAgent.name}.` +
+            (unassigned ? " Unassigned, since the previous assignee is not in the new department." : "")
+        );
+    });
+
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Optional reminder/expiry date, generic on any ticket (not restricted to
@@ -1330,30 +1431,34 @@ router.post("/tickets/:id/transfer", requireAdmin, verifyCsrf, (req, res) => {
 // periodic check that emails the ticket's department once this date starts
 // approaching. Mirrors src/assets.js's warranty_expires update exactly: a
 // changed date clears reminder_alerted_at so it can alert again later.
-router.post("/tickets/:id/reminder", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/reminder", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const raw = (req.body.reminder_date || "").trim().slice(0, 10);
-  if (raw && !/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return res.status(400).render("error", { title: "Invalid date", message: "Enter a valid reminder date." });
+    const raw = (req.body.reminder_date || "").trim().slice(0, 10);
+    if (raw && !/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+      return res.status(400).render("error", { title: "Invalid date", message: "Enter a valid reminder date." });
+    }
+    const reminderDate = raw || null;
+    const changed = (ticket.reminder_date || null) !== reminderDate;
+
+    await db
+      .prepare(
+        `UPDATE tickets SET reminder_date = ?, updated_at = now_text()${changed ? ", reminder_alerted_at = NULL" : ""} WHERE id = ?`
+      )
+      .run(reminderDate, ticket.id);
+
+    if (changed) {
+      await db
+        .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`)
+        .run(ticket.id, req.session.agentId, reminderDate ? `Reminder date set to ${reminderDate}.` : "Reminder date cleared.");
+    }
+
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
   }
-  const reminderDate = raw || null;
-  const changed = (ticket.reminder_date || null) !== reminderDate;
-
-  db.prepare(
-    `UPDATE tickets SET reminder_date = ?, updated_at = datetime('now')${changed ? ", reminder_alerted_at = NULL" : ""} WHERE id = ?`
-  ).run(reminderDate, ticket.id);
-
-  if (changed) {
-    db.prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`).run(
-      ticket.id,
-      req.session.agentId,
-      reminderDate ? `Reminder date set to ${reminderDate}.` : "Reminder date cleared."
-    );
-  }
-
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
 });
 
 // Shared by the single-ticket assign route and the bulk-assign route below.
@@ -1361,44 +1466,47 @@ router.post("/tickets/:id/reminder", verifyCsrf, (req, res) => {
 // server-side regardless of what the submitted select actually offered -
 // "only agents in that department are eligible" is one rule, applied here
 // once, not re-implemented (and potentially drifted) per call site.
-function applyAssignment(ticket, newAssigneeId, agentId) {
+async function applyAssignment(ticket, newAssigneeId, agentId) {
   if (newAssigneeId === ticket.assigned_to) return true;
   if (newAssigneeId) {
-    const assignee = db.prepare("SELECT id, name, department_id, is_admin FROM agents WHERE id = ? AND active = 1").get(newAssigneeId);
-    if (!assignee || !departments.isEligibleAssignee(assignee, ticket.category)) return false;
+    const assignee = await db
+      .prepare("SELECT id, name, department_id, is_admin FROM agents WHERE id = ? AND active = 1")
+      .get(newAssigneeId);
+    if (!assignee || !(await departments.isEligibleAssignee(assignee, ticket.category))) return false;
   }
 
-  db.prepare("UPDATE tickets SET assigned_to = ?, updated_at = datetime('now') WHERE id = ?").run(
-    newAssigneeId,
-    ticket.id
-  );
-  const label = newAssigneeId ? db.prepare("SELECT name FROM agents WHERE id = ?").get(newAssigneeId).name : "Unassigned";
-  db.prepare(
-    `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'assignment', ?)`
-  ).run(ticket.id, agentId, `Assigned to ${label}.`);
+  await db.prepare("UPDATE tickets SET assigned_to = ?, updated_at = now_text() WHERE id = ?").run(newAssigneeId, ticket.id);
+  const label = newAssigneeId ? (await db.prepare("SELECT name FROM agents WHERE id = ?").get(newAssigneeId)).name : "Unassigned";
+  await db
+    .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'assignment', ?)`)
+    .run(ticket.id, agentId, `Assigned to ${label}.`);
   triggerWebhooks(
     "ticket.assigned",
     { ticket_id: ticket.id, subject: ticket.subject, assigned_to: label },
-    departments.departmentIdForCategory(ticket.category)
+    await departments.departmentIdForCategory(ticket.category)
   );
   return true;
 }
 
-router.post("/tickets/:id/assign", verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/assign", verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const raw = req.body.assigned_to;
-  const newAssigneeId = raw ? parseInt(raw, 10) : null;
-  const ok = applyAssignment(ticket, newAssigneeId, req.session.agentId);
-  if (!ok) {
-    return res.status(400).render("error", {
-      title: "Invalid agent",
-      message: "That agent does not exist, is not active, or is not in this ticket's department.",
-    });
+    const raw = req.body.assigned_to;
+    const newAssigneeId = raw ? parseInt(raw, 10) : null;
+    const ok = await applyAssignment(ticket, newAssigneeId, req.session.agentId);
+    if (!ok) {
+      return res.status(400).render("error", {
+        title: "Invalid agent",
+        message: "That agent does not exist, is not active, or is not in this ticket's department.",
+      });
+    }
+
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
   }
-
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
 });
 
 // Bulk actions: same underlying logic as the single-ticket routes above
@@ -1423,177 +1531,209 @@ function parseTicketIds(body) {
 // POST body, so it can't just trust that without a tampered request being
 // able to reach an out-of-department ticket via this path even though the
 // list itself never showed it.
-function visibleTicketOrNull(agent, id) {
-  const ticket = db.prepare("SELECT * FROM tickets WHERE id = ?").get(id);
-  return ticket && departments.canSeeTicket(agent, ticket) ? ticket : null;
+async function visibleTicketOrNull(agent, id) {
+  const ticket = await db.prepare("SELECT * FROM tickets WHERE id = ?").get(id);
+  return ticket && (await departments.canSeeTicket(agent, ticket)) ? ticket : null;
 }
 
-router.post("/bulk/status", verifyCsrf, (req, res) => {
-  const ids = parseTicketIds(req.body);
-  if (ids.length && STATUSES.includes(req.body.status)) {
-    for (const id of ids) {
-      const ticket = visibleTicketOrNull(res.locals.currentAgent, id);
-      if (ticket) applyStatusChange(ticket, req.body.status, req.session.agentId);
+router.post("/bulk/status", verifyCsrf, async (req, res, next) => {
+  try {
+    const ids = parseTicketIds(req.body);
+    if (ids.length && STATUSES.includes(req.body.status)) {
+      for (const id of ids) {
+        const ticket = await visibleTicketOrNull(res.locals.currentAgent, id);
+        if (ticket) await applyStatusChange(ticket, req.body.status, req.session.agentId);
+      }
     }
+    bulkRedirect(req, res);
+  } catch (err) {
+    next(err);
   }
-  bulkRedirect(req, res);
 });
 
-router.post("/bulk/assign", verifyCsrf, (req, res) => {
-  const ids = parseTicketIds(req.body);
-  const raw = req.body.assigned_to;
-  const newAssigneeId = raw ? parseInt(raw, 10) : null;
-  if (ids.length) {
-    for (const id of ids) {
-      const ticket = visibleTicketOrNull(res.locals.currentAgent, id);
-      if (ticket) applyAssignment(ticket, newAssigneeId, req.session.agentId);
+router.post("/bulk/assign", verifyCsrf, async (req, res, next) => {
+  try {
+    const ids = parseTicketIds(req.body);
+    const raw = req.body.assigned_to;
+    const newAssigneeId = raw ? parseInt(raw, 10) : null;
+    if (ids.length) {
+      for (const id of ids) {
+        const ticket = await visibleTicketOrNull(res.locals.currentAgent, id);
+        if (ticket) await applyAssignment(ticket, newAssigneeId, req.session.agentId);
+      }
     }
+    bulkRedirect(req, res);
+  } catch (err) {
+    next(err);
   }
-  bulkRedirect(req, res);
 });
 
 // Adds (or removes) one tag across every selected ticket in one go, reusing
 // the same addTagToTicket/removeTagFromTicket helpers the single-ticket tag
 // form already uses - so case-insensitive reuse and the tag catalog stay
 // consistent whichever way a tag gets applied.
-router.post("/bulk/tag", verifyCsrf, (req, res) => {
-  const ids = parseTicketIds(req.body);
-  const name = (req.body.tag_name || "").trim();
-  if (ids.length && name) {
-    for (const id of ids) {
-      if (visibleTicketOrNull(res.locals.currentAgent, id)) {
-        if (req.body.tag_action === "remove") {
-          const tag = db.prepare("SELECT id FROM tags WHERE name = ? COLLATE NOCASE").get(name);
-          if (tag) removeTagFromTicket(id, tag.id);
-        } else {
-          addTagToTicket(id, name);
+router.post("/bulk/tag", verifyCsrf, async (req, res, next) => {
+  try {
+    const ids = parseTicketIds(req.body);
+    const name = (req.body.tag_name || "").trim();
+    if (ids.length && name) {
+      for (const id of ids) {
+        if (await visibleTicketOrNull(res.locals.currentAgent, id)) {
+          if (req.body.tag_action === "remove") {
+            const tag = await db.prepare("SELECT id FROM tags WHERE LOWER(name) = LOWER(?)").get(name);
+            if (tag) await removeTagFromTicket(id, tag.id);
+          } else {
+            await addTagToTicket(id, name);
+          }
         }
       }
     }
+    bulkRedirect(req, res);
+  } catch (err) {
+    next(err);
   }
-  bulkRedirect(req, res);
 });
 
-router.post("/tickets/:id/note", handleUpload("attachments"), verifyCsrf, (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.post("/tickets/:id/note", handleUpload("attachments"), verifyCsrf, async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const body = (req.body.body || "").trim();
-  const hasFiles = req.files && req.files.length;
+    const body = (req.body.body || "").trim();
+    const hasFiles = req.files && req.files.length;
 
-  if (req.uploadError) {
-    deleteUploadedFiles(req.files);
-    return res.status(400).render("error", { title: "Upload failed", message: req.uploadError });
-  }
-  if (!body && !hasFiles) {
-    return res.status(400).render("error", { title: "Empty note", message: "Add note text, an attachment, or both." });
-  }
-  if (body.length > 5000) {
-    deleteUploadedFiles(req.files);
-    return res.status(400).render("error", { title: "Note too long", message: "Notes must be under 5000 characters." });
-  }
-
-  const isPublicReply = req.body.visibility === "reply";
-
-  if (body) {
-    db.prepare(
-      `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, ?, ?)`
-    ).run(ticket.id, req.session.agentId, isPublicReply ? "reply" : "note", body);
-
-    if (isPublicReply) {
-      sendReplyEmail({ to: ticket.requester_email, ticketId: ticket.id, subject: ticket.subject, message: body }).catch(
-        (err) => console.error("Could not send reply email:", err.message)
-      );
+    if (req.uploadError) {
+      deleteUploadedFiles(req.files);
+      return res.status(400).render("error", { title: "Upload failed", message: req.uploadError });
+    }
+    if (!body && !hasFiles) {
+      return res.status(400).render("error", { title: "Empty note", message: "Add note text, an attachment, or both." });
+    }
+    if (body.length > 5000) {
+      deleteUploadedFiles(req.files);
+      return res.status(400).render("error", { title: "Note too long", message: "Notes must be under 5000 characters." });
     }
 
-    const author = db.prepare("SELECT name FROM agents WHERE id = ?").get(req.session.agentId);
-    for (const mentioned of findMentionedAgents(body, req.session.agentId)) {
-      sendMentionEmail({
-        to: mentioned.email,
+    const isPublicReply = req.body.visibility === "reply";
+
+    if (body) {
+      await db
+        .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, ?, ?)`)
+        .run(ticket.id, req.session.agentId, isPublicReply ? "reply" : "note", body);
+
+      if (isPublicReply) {
+        sendReplyEmail({ to: ticket.requester_email, ticketId: ticket.id, subject: ticket.subject, message: body }).catch((err) =>
+          console.error("Could not send reply email:", err.message)
+        );
+      }
+
+      const author = await db.prepare("SELECT name FROM agents WHERE id = ?").get(req.session.agentId);
+      for (const mentioned of await findMentionedAgents(body, req.session.agentId)) {
+        sendMentionEmail({
+          to: mentioned.email,
+          ticketId: ticket.id,
+          subject: ticket.subject,
+          mentionedBy: author ? author.name : "Someone",
+          message: body,
+        }).catch((err) => console.error("Could not send mention email:", err.message));
+        await notifications.create(
+          mentioned.id,
+          "mention",
+          ticket.id,
+          `${author ? author.name : "Someone"} mentioned you on ticket #${ticket.id}.`
+        );
+      }
+    }
+    if (hasFiles) {
+      await saveAttachments({
         ticketId: ticket.id,
-        subject: ticket.subject,
-        mentionedBy: author ? author.name : "Someone",
-        message: body,
-      }).catch((err) => console.error("Could not send mention email:", err.message));
-      notifications.create(mentioned.id, "mention", ticket.id, `${author ? author.name : "Someone"} mentioned you on ticket #${ticket.id}.`);
+        files: req.files,
+        uploadedBy: "agent",
+        agentId: req.session.agentId,
+        visibleToRequester: isPublicReply,
+      });
+      const names = req.files.map((f) => f.originalname).join(", ");
+      await db
+        .prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`)
+        .run(ticket.id, req.session.agentId, `Added attachment${req.files.length > 1 ? "s" : ""}: ${names}`);
     }
-  }
-  if (hasFiles) {
-    saveAttachments({
-      ticketId: ticket.id,
-      files: req.files,
-      uploadedBy: "agent",
-      agentId: req.session.agentId,
-      visibleToRequester: isPublicReply,
-    });
-    const names = req.files.map((f) => f.originalname).join(", ");
-    db.prepare(
-      `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`
-    ).run(ticket.id, req.session.agentId, `Added attachment${req.files.length > 1 ? "s" : ""}: ${names}`);
-  }
-  db.prepare("UPDATE tickets SET updated_at = datetime('now') WHERE id = ?").run(ticket.id);
+    await db.prepare("UPDATE tickets SET updated_at = now_text() WHERE id = ?").run(ticket.id);
 
-  res.redirect(`/dashboard/tickets/${ticket.id}`);
+    res.redirect(`/dashboard/tickets/${ticket.id}`);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Gated by the router.use(requireAgent) above - any logged-in agent can pull
 // any ticket's attachments, same access level they already have to everything
 // else on the ticket.
-router.get("/tickets/:id/attachments/:attachmentId/download", (req, res) => {
-  const ticket = getTicketOr404(req, res, req.params.id);
-  if (!ticket) return;
+router.get("/tickets/:id/attachments/:attachmentId/download", async (req, res, next) => {
+  try {
+    const ticket = await getTicketOr404(req, res, req.params.id);
+    if (!ticket) return;
 
-  const attachment = getAttachment(ticket.id, req.params.attachmentId);
-  if (!attachment) {
-    return res.status(404).render("error", { title: "Not found", message: "That attachment does not exist." });
+    const attachment = await getAttachment(ticket.id, req.params.attachmentId);
+    if (!attachment) {
+      return res.status(404).render("error", { title: "Not found", message: "That attachment does not exist." });
+    }
+
+    res.download(path.join(ATTACHMENTS_DIR, attachment.stored_name), attachment.original_name);
+  } catch (err) {
+    next(err);
   }
-
-  res.download(path.join(ATTACHMENTS_DIR, attachment.stored_name), attachment.original_name);
 });
 
 // Every template alongside its own checklist items (see src/checklists.js)
 // - a plain checklist line, or one that spawns its own ticket in another
 // (or the same) department's category the moment this template is used.
-function templatesWithChecklists() {
-  return db
-    .prepare("SELECT * FROM ticket_templates ORDER BY name")
-    .all()
-    .map((t) => ({ ...t, checklistItems: checklists.itemsForTemplate(t.id) }));
+async function templatesWithChecklists() {
+  const templates = await db.prepare("SELECT * FROM ticket_templates ORDER BY name").all();
+  return Promise.all(templates.map(async (t) => ({ ...t, checklistItems: await checklists.itemsForTemplate(t.id) })));
 }
 
-router.get("/templates", (req, res) => {
-  res.render("dashboard/templates", {
-    title: "Ticket templates",
-    templates: templatesWithChecklists(),
-    categories: departments.categoryNames(),
-    categoriesByDepartment: departments.categoriesByDepartment(),
-    error: null,
-  });
-});
-
-router.post("/templates", verifyCsrf, (req, res) => {
-  const { name = "", category = "", subject = "", description = "" } = req.body;
-  if (!name.trim() || !departments.isValidCategoryName(category) || !subject.trim() || !description.trim()) {
-    return res.status(400).render("dashboard/templates", {
+router.get("/templates", async (req, res, next) => {
+  try {
+    res.render("dashboard/templates", {
       title: "Ticket templates",
-      templates: templatesWithChecklists(),
-      categories: departments.categoryNames(),
-      categoriesByDepartment: departments.categoriesByDepartment(),
-      error: "Name, category, subject, and description are all required.",
+      templates: await templatesWithChecklists(),
+      categories: await departments.categoryNames(),
+      categoriesByDepartment: await departments.categoriesByDepartment(),
+      error: null,
     });
+  } catch (err) {
+    next(err);
   }
-  db.prepare("INSERT INTO ticket_templates (name, category, subject, description) VALUES (?, ?, ?, ?)").run(
-    name.trim().slice(0, 100),
-    category,
-    subject.trim().slice(0, 200),
-    description.trim().slice(0, 5000)
-  );
-  res.redirect("/dashboard/templates");
 });
 
-router.post("/templates/:id/delete", verifyCsrf, (req, res) => {
-  db.prepare("DELETE FROM ticket_templates WHERE id = ?").run(req.params.id);
-  res.redirect("/dashboard/templates");
+router.post("/templates", verifyCsrf, async (req, res, next) => {
+  try {
+    const { name = "", category = "", subject = "", description = "" } = req.body;
+    if (!name.trim() || !(await departments.isValidCategoryName(category)) || !subject.trim() || !description.trim()) {
+      return res.status(400).render("dashboard/templates", {
+        title: "Ticket templates",
+        templates: await templatesWithChecklists(),
+        categories: await departments.categoryNames(),
+        categoriesByDepartment: await departments.categoriesByDepartment(),
+        error: "Name, category, subject, and description are all required.",
+      });
+    }
+    await db
+      .prepare("INSERT INTO ticket_templates (name, category, subject, description) VALUES (?, ?, ?, ?)")
+      .run(name.trim().slice(0, 100), category, subject.trim().slice(0, 200), description.trim().slice(0, 5000));
+    res.redirect("/dashboard/templates");
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/templates/:id/delete", verifyCsrf, async (req, res, next) => {
+  try {
+    await db.prepare("DELETE FROM ticket_templates WHERE id = ?").run(req.params.id);
+    res.redirect("/dashboard/templates");
+  } catch (err) {
+    next(err);
+  }
 });
 
 // A checklist line on a template - see src/checklists.js. spawn_category is
@@ -1601,64 +1741,88 @@ router.post("/templates/:id/delete", verifyCsrf, (req, res) => {
 // the template's own category: an HR template is free to spawn an IT and a
 // Marketing ticket (the onboarding use case this is for), but nothing here
 // requires it to leave HR either.
-router.post("/templates/:id/checklist-items", verifyCsrf, (req, res) => {
-  const template = db.prepare("SELECT * FROM ticket_templates WHERE id = ?").get(req.params.id);
-  if (!template) return res.status(404).render("error", { title: "Not found", message: "That template does not exist." });
+router.post("/templates/:id/checklist-items", verifyCsrf, async (req, res, next) => {
+  try {
+    const template = await db.prepare("SELECT * FROM ticket_templates WHERE id = ?").get(req.params.id);
+    if (!template) return res.status(404).render("error", { title: "Not found", message: "That template does not exist." });
 
-  const result = checklists.addChecklistItem(template.id, {
-    label: req.body.label,
-    spawnCategory: req.body.spawn_category,
-  });
-  if (result.error) {
-    return res.status(400).render("dashboard/templates", {
-      title: "Ticket templates",
-      templates: templatesWithChecklists(),
-      categories: departments.categoryNames(),
-      categoriesByDepartment: departments.categoriesByDepartment(),
-      error: result.error,
+    const result = await checklists.addChecklistItem(template.id, {
+      label: req.body.label,
+      spawnCategory: req.body.spawn_category,
     });
+    if (result.error) {
+      return res.status(400).render("dashboard/templates", {
+        title: "Ticket templates",
+        templates: await templatesWithChecklists(),
+        categories: await departments.categoryNames(),
+        categoriesByDepartment: await departments.categoriesByDepartment(),
+        error: result.error,
+      });
+    }
+    res.redirect("/dashboard/templates");
+  } catch (err) {
+    next(err);
   }
-  res.redirect("/dashboard/templates");
 });
 
-router.post("/templates/:id/checklist-items/:itemId/delete", verifyCsrf, (req, res) => {
-  checklists.removeChecklistItem(req.params.itemId);
-  res.redirect("/dashboard/templates");
+router.post("/templates/:id/checklist-items/:itemId/delete", verifyCsrf, async (req, res, next) => {
+  try {
+    await checklists.removeChecklistItem(req.params.itemId);
+    res.redirect("/dashboard/templates");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/recurring", (req, res) => {
-  res.render("dashboard/recurring", {
-    title: "Recurring tickets",
-    recurring: recurring.all(),
-    categories: departments.categoryNames(),
-    priorities: PRIORITIES,
-    error: null,
-  });
-});
-
-router.post("/recurring", verifyCsrf, (req, res) => {
-  const result = recurring.create(req.body);
-  if (result.error) {
-    return res.status(400).render("dashboard/recurring", {
+router.get("/recurring", async (req, res, next) => {
+  try {
+    res.render("dashboard/recurring", {
       title: "Recurring tickets",
-      recurring: recurring.all(),
-      categories: departments.categoryNames(),
+      recurring: await recurring.all(),
+      categories: await departments.categoryNames(),
       priorities: PRIORITIES,
-      error: result.error,
+      error: null,
     });
+  } catch (err) {
+    next(err);
   }
-  res.redirect("/dashboard/recurring");
 });
 
-router.post("/recurring/:id/toggle", verifyCsrf, (req, res) => {
-  const row = db.prepare("SELECT active FROM recurring_tickets WHERE id = ?").get(req.params.id);
-  if (row) recurring.setActive(req.params.id, !row.active);
-  res.redirect("/dashboard/recurring");
+router.post("/recurring", verifyCsrf, async (req, res, next) => {
+  try {
+    const result = await recurring.create(req.body);
+    if (result.error) {
+      return res.status(400).render("dashboard/recurring", {
+        title: "Recurring tickets",
+        recurring: await recurring.all(),
+        categories: await departments.categoryNames(),
+        priorities: PRIORITIES,
+        error: result.error,
+      });
+    }
+    res.redirect("/dashboard/recurring");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/recurring/:id/delete", verifyCsrf, (req, res) => {
-  db.prepare("DELETE FROM recurring_tickets WHERE id = ?").run(req.params.id);
-  res.redirect("/dashboard/recurring");
+router.post("/recurring/:id/toggle", verifyCsrf, async (req, res, next) => {
+  try {
+    const row = await db.prepare("SELECT active FROM recurring_tickets WHERE id = ?").get(req.params.id);
+    if (row) await recurring.setActive(req.params.id, !row.active);
+    res.redirect("/dashboard/recurring");
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/recurring/:id/delete", verifyCsrf, async (req, res, next) => {
+  try {
+    await db.prepare("DELETE FROM recurring_tickets WHERE id = ?").run(req.params.id);
+    res.redirect("/dashboard/recurring");
+  } catch (err) {
+    next(err);
+  }
 });
 
 // The dashboard KB list is scoped per item 7 of the multi-department
@@ -1666,195 +1830,259 @@ router.post("/recurring/:id/delete", verifyCsrf, (req, res) => {
 // (kb.forAgent), an admin sees all (same function, since it already treats
 // is_admin as "no restriction"). The public /kb browsing list is untouched -
 // department-specific public-facing content is explicitly out of scope.
-router.get("/kb", (req, res) => {
-  res.render("dashboard/kb", { title: "Knowledge base", articles: kb.forAgent(res.locals.currentAgent) });
+router.get("/kb", async (req, res, next) => {
+  try {
+    res.render("dashboard/kb", { title: "Knowledge base", articles: await kb.forAgent(res.locals.currentAgent) });
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/kb/new", (req, res) => {
-  res.render("dashboard/kb-edit", { title: "New article", article: null, categories: departments.categoryNames(), departmentsList: departments.all(), error: null });
-});
-
-router.post("/kb/new", verifyCsrf, (req, res) => {
-  const result = kb.create(req.body, req.session.agentId);
-  if (result.error) {
-    return res.status(400).render("dashboard/kb-edit", {
+router.get("/kb/new", async (req, res, next) => {
+  try {
+    res.render("dashboard/kb-edit", {
       title: "New article",
-      article: req.body,
-      categories: departments.categoryNames(),
-      departmentsList: departments.all(),
-      error: result.error,
+      article: null,
+      categories: await departments.categoryNames(),
+      departmentsList: await departments.all(),
+      error: null,
     });
+  } catch (err) {
+    next(err);
   }
-  res.redirect(`/dashboard/kb/${result.id}/edit`);
 });
 
-router.get("/kb/:id/edit", (req, res) => {
-  const article = kb.get(req.params.id);
-  if (!article) return res.status(404).render("error", { title: "Not found", message: "That article does not exist." });
-  res.render("dashboard/kb-edit", { title: article.title, article, categories: departments.categoryNames(), departmentsList: departments.all(), error: null });
+router.post("/kb/new", verifyCsrf, async (req, res, next) => {
+  try {
+    const result = await kb.create(req.body, req.session.agentId);
+    if (result.error) {
+      return res.status(400).render("dashboard/kb-edit", {
+        title: "New article",
+        article: req.body,
+        categories: await departments.categoryNames(),
+        departmentsList: await departments.all(),
+        error: result.error,
+      });
+    }
+    res.redirect(`/dashboard/kb/${result.id}/edit`);
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/kb/:id/edit", verifyCsrf, (req, res) => {
-  const article = kb.get(req.params.id);
-  if (!article) return res.status(404).render("error", { title: "Not found", message: "That article does not exist." });
-  const result = kb.update(article.id, req.body);
-  if (result.error) {
-    return res.status(400).render("dashboard/kb-edit", {
+router.get("/kb/:id/edit", async (req, res, next) => {
+  try {
+    const article = await kb.get(req.params.id);
+    if (!article) return res.status(404).render("error", { title: "Not found", message: "That article does not exist." });
+    res.render("dashboard/kb-edit", {
       title: article.title,
-      article: { ...article, ...req.body },
-      categories: departments.categoryNames(),
-      departmentsList: departments.all(),
-      error: result.error,
+      article,
+      categories: await departments.categoryNames(),
+      departmentsList: await departments.all(),
+      error: null,
     });
+  } catch (err) {
+    next(err);
   }
-  res.redirect(`/dashboard/kb/${article.id}/edit`);
+});
+
+router.post("/kb/:id/edit", verifyCsrf, async (req, res, next) => {
+  try {
+    const article = await kb.get(req.params.id);
+    if (!article) return res.status(404).render("error", { title: "Not found", message: "That article does not exist." });
+    const result = await kb.update(article.id, req.body);
+    if (result.error) {
+      return res.status(400).render("dashboard/kb-edit", {
+        title: article.title,
+        article: { ...article, ...req.body },
+        categories: await departments.categoryNames(),
+        departmentsList: await departments.all(),
+        error: result.error,
+      });
+    }
+    res.redirect(`/dashboard/kb/${article.id}/edit`);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Scoped like kb.forAgent() above: what the acting agent can see and
 // manage - every shared response plus their own department's, or every
 // response for an admin.
-router.get("/canned-responses", (req, res) => {
-  res.render("dashboard/canned-responses", {
-    title: "Canned responses",
-    responses: canned.forAgent(res.locals.currentAgent),
-    departmentsList: departments.all(),
-    error: null,
-  });
+router.get("/canned-responses", async (req, res, next) => {
+  try {
+    res.render("dashboard/canned-responses", {
+      title: "Canned responses",
+      responses: await canned.forAgent(res.locals.currentAgent),
+      departmentsList: await departments.all(),
+      error: null,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/canned-responses", verifyCsrf, (req, res) => {
-  const { title = "", body = "" } = req.body;
-  const departmentId = req.body.department_id ? parseInt(req.body.department_id, 10) : null;
-  if (!title.trim() || !body.trim()) {
-    return res
-      .status(400)
-      .render("dashboard/canned-responses", {
+router.post("/canned-responses", verifyCsrf, async (req, res, next) => {
+  try {
+    const { title = "", body = "" } = req.body;
+    const departmentId = req.body.department_id ? parseInt(req.body.department_id, 10) : null;
+    if (!title.trim() || !body.trim()) {
+      return res.status(400).render("dashboard/canned-responses", {
         title: "Canned responses",
-        responses: canned.forAgent(res.locals.currentAgent),
-        departmentsList: departments.all(),
+        responses: await canned.forAgent(res.locals.currentAgent),
+        departmentsList: await departments.all(),
         error: "Both a title and body are required.",
       });
+    }
+    await canned.create(title, body, departmentId);
+    res.redirect("/dashboard/canned-responses");
+  } catch (err) {
+    next(err);
   }
-  canned.create(title, body, departmentId);
-  res.redirect("/dashboard/canned-responses");
 });
 
-router.post("/canned-responses/:id/delete", verifyCsrf, (req, res) => {
-  canned.remove(req.params.id);
-  res.redirect("/dashboard/canned-responses");
+router.post("/canned-responses/:id/delete", verifyCsrf, async (req, res, next) => {
+  try {
+    await canned.remove(req.params.id);
+    res.redirect("/dashboard/canned-responses");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/assets", (req, res) => {
-  const { status = "", category = "", q = "" } = req.query;
-  const filters = { status, category, q };
+router.get("/assets", async (req, res, next) => {
+  try {
+    const { status = "", category = "", q = "" } = req.query;
+    const filters = { status, category, q };
 
-  const totalCount = assets.count(filters);
-  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
-  const page = Math.min(Math.max(parseInt(req.query.page, 10) || 1, 1), totalPages);
-  const offset = (page - 1) * PAGE_SIZE;
+    const totalCount = await assets.count(filters);
+    const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+    const page = Math.min(Math.max(parseInt(req.query.page, 10) || 1, 1), totalPages);
+    const offset = (page - 1) * PAGE_SIZE;
 
-  const cutoff = new Date(Date.now() + WARRANTY_ALERT_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const today = new Date().toISOString().slice(0, 10);
-  const items = assets.all(filters, { limit: PAGE_SIZE, offset }).map((a) => ({
-    ...a,
-    warranty_expired: Boolean(a.warranty_expires && a.warranty_expires < today),
-    warranty_expiring_soon: Boolean(a.warranty_expires && a.warranty_expires >= today && a.warranty_expires <= cutoff),
-  }));
-  res.render("dashboard/assets", {
-    title: "Assets",
-    wide: true,
-    items,
-    filters,
-    categories: ASSET_CATEGORIES,
-    statuses: ASSET_STATUSES,
-    statusCounts: assets.countsByStatus(),
-    page,
-    totalPages,
-    totalCount,
-    values: {},
-    error: null,
-    exportQuery: new URLSearchParams(Object.fromEntries(Object.entries(filters).filter(([, v]) => v))).toString(),
-  });
-});
-
-router.post("/assets", verifyCsrf, (req, res) => {
-  const result = assets.create(req.body, req.session.agentId);
-  if (result.error) {
-    return res.status(400).render("dashboard/assets", {
+    const cutoff = new Date(Date.now() + WARRANTY_ALERT_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const today = new Date().toISOString().slice(0, 10);
+    const rows = await assets.all(filters, { limit: PAGE_SIZE, offset });
+    const items = rows.map((a) => ({
+      ...a,
+      warranty_expired: Boolean(a.warranty_expires && a.warranty_expires < today),
+      warranty_expiring_soon: Boolean(a.warranty_expires && a.warranty_expires >= today && a.warranty_expires <= cutoff),
+    }));
+    res.render("dashboard/assets", {
       title: "Assets",
       wide: true,
-      items: assets.all({}, { limit: PAGE_SIZE, offset: 0 }),
-      filters: { status: "", category: "", q: "" },
+      items,
+      filters,
       categories: ASSET_CATEGORIES,
       statuses: ASSET_STATUSES,
-      statusCounts: assets.countsByStatus(),
-      page: 1,
-      totalPages: Math.max(1, Math.ceil(assets.count({}) / PAGE_SIZE)),
-      totalCount: assets.count({}),
-      values: req.body,
-      error: result.error,
-      exportQuery: "",
+      statusCounts: await assets.countsByStatus(),
+      page,
+      totalPages,
+      totalCount,
+      values: {},
+      error: null,
+      exportQuery: new URLSearchParams(Object.fromEntries(Object.entries(filters).filter(([, v]) => v))).toString(),
     });
+  } catch (err) {
+    next(err);
   }
-  res.redirect(`/dashboard/assets/${result.id}`);
+});
+
+router.post("/assets", verifyCsrf, async (req, res, next) => {
+  try {
+    const result = await assets.create(req.body, req.session.agentId);
+    if (result.error) {
+      const totalCount = await assets.count({});
+      return res.status(400).render("dashboard/assets", {
+        title: "Assets",
+        wide: true,
+        items: await assets.all({}, { limit: PAGE_SIZE, offset: 0 }),
+        filters: { status: "", category: "", q: "" },
+        categories: ASSET_CATEGORIES,
+        statuses: ASSET_STATUSES,
+        statusCounts: await assets.countsByStatus(),
+        page: 1,
+        totalPages: Math.max(1, Math.ceil(totalCount / PAGE_SIZE)),
+        totalCount,
+        values: req.body,
+        error: result.error,
+        exportQuery: "",
+      });
+    }
+    res.redirect(`/dashboard/assets/${result.id}`);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Mirrors /dashboard/export.csv for tickets. Defined before /assets/:id so
 // Express doesn't match "export.csv" as an :id first.
-router.get("/assets/export.csv", (req, res) => {
-  const { status = "", category = "", q = "" } = req.query;
-  const csv = toCsv(assets.all({ status, category, q }), [
-    { key: "id", header: "ID" },
-    { key: "name", header: "Name" },
-    { key: "asset_tag", header: "Asset tag" },
-    { key: "category", header: "Category" },
-    { key: "status", header: "Status" },
-    { key: "assigned_to_name", header: "Assigned to" },
-    { key: "location", header: "Location" },
-    { key: "serial_number", header: "Serial number" },
-    { key: "vendor", header: "Vendor" },
-    { key: "purchase_date", header: "Purchase date" },
-    { key: "warranty_expires", header: "Warranty expiry" },
-  ]);
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="assets-${Date.now()}.csv"`);
-  res.send(csv);
+router.get("/assets/export.csv", async (req, res, next) => {
+  try {
+    const { status = "", category = "", q = "" } = req.query;
+    const csv = toCsv(await assets.all({ status, category, q }), [
+      { key: "id", header: "ID" },
+      { key: "name", header: "Name" },
+      { key: "asset_tag", header: "Asset tag" },
+      { key: "category", header: "Category" },
+      { key: "status", header: "Status" },
+      { key: "assigned_to_name", header: "Assigned to" },
+      { key: "location", header: "Location" },
+      { key: "serial_number", header: "Serial number" },
+      { key: "vendor", header: "Vendor" },
+      { key: "purchase_date", header: "Purchase date" },
+      { key: "warranty_expires", header: "Warranty expiry" },
+    ]);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="assets-${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/assets/:id", (req, res) => {
-  const asset = assets.get(req.params.id);
-  if (!asset) {
-    return res.status(404).render("error", { title: "Not found", message: "That asset does not exist." });
-  }
-  res.render("dashboard/asset", {
-    title: asset.name,
-    asset,
-    tickets: assets.ticketsForAsset(asset.id),
-    activity: assets.activityForAsset(asset.id),
-    categories: ASSET_CATEGORIES,
-    statuses: ASSET_STATUSES,
-    error: null,
-  });
-});
-
-router.post("/assets/:id", verifyCsrf, (req, res) => {
-  const asset = assets.get(req.params.id);
-  if (!asset) {
-    return res.status(404).render("error", { title: "Not found", message: "That asset does not exist." });
-  }
-  const result = assets.update(asset.id, req.body, req.session.agentId);
-  if (result.error) {
-    return res.status(400).render("dashboard/asset", {
+router.get("/assets/:id", async (req, res, next) => {
+  try {
+    const asset = await assets.get(req.params.id);
+    if (!asset) {
+      return res.status(404).render("error", { title: "Not found", message: "That asset does not exist." });
+    }
+    res.render("dashboard/asset", {
       title: asset.name,
-      asset: { ...asset, ...req.body },
-      tickets: assets.ticketsForAsset(asset.id),
-      activity: assets.activityForAsset(asset.id),
+      asset,
+      tickets: await assets.ticketsForAsset(asset.id),
+      activity: await assets.activityForAsset(asset.id),
       categories: ASSET_CATEGORIES,
       statuses: ASSET_STATUSES,
-      error: result.error,
+      error: null,
     });
+  } catch (err) {
+    next(err);
   }
-  res.redirect(`/dashboard/assets/${asset.id}`);
+});
+
+router.post("/assets/:id", verifyCsrf, async (req, res, next) => {
+  try {
+    const asset = await assets.get(req.params.id);
+    if (!asset) {
+      return res.status(404).render("error", { title: "Not found", message: "That asset does not exist." });
+    }
+    const result = await assets.update(asset.id, req.body, req.session.agentId);
+    if (result.error) {
+      return res.status(400).render("dashboard/asset", {
+        title: asset.name,
+        asset: { ...asset, ...req.body },
+        tickets: await assets.ticketsForAsset(asset.id),
+        activity: await assets.activityForAsset(asset.id),
+        categories: ASSET_CATEGORIES,
+        statuses: ASSET_STATUSES,
+        error: result.error,
+      });
+    }
+    res.redirect(`/dashboard/assets/${asset.id}`);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // The CSP here has no 'unsafe-inline' for styles, so a bar's size can't be
@@ -1956,11 +2184,15 @@ function eachMonthBucket(from, to) {
 // {range, from, to} from resolveReportRange() above; `unit` ("day" or
 // "month") from reportBucketUnit() - passed in rather than recomputed here
 // since the "/" route needs `unit` too, for the range-picker form itself.
-function buildReportsData(reportRange, unit, agent) {
+async function buildReportsData(reportRange, unit, agent) {
   const { from, to } = reportRange;
   const rangeParams = [from, to];
-  const rangeWhere = "created_at >= ? AND created_at < date(?, '+1 day')";
-  const bucketExpr = unit === "day" ? "date(created_at)" : "strftime('%Y-%m', created_at)";
+  // SQLite's `date(x, '+1 day')` has no direct Postgres equivalent - cast to
+  // ::date, add an interval, then cast back to ::text so the comparison
+  // against created_at (stored as TEXT, see src/db/index.js's design notes)
+  // still works as a plain string comparison, same as it did in SQLite.
+  const rangeWhere = "created_at >= ? AND created_at < (?::date + INTERVAL '1 day')::text";
+  const bucketExpr = unit === "day" ? "created_at::date::text" : "to_char(created_at::timestamp, 'YYYY-MM')";
   const bucketKeys = unit === "day" ? eachDayBucket(from, to) : eachMonthBucket(from, to);
   // Every query below is additionally scoped by this - a non-admin's
   // reports only ever reflect their own department's tickets, same as the
@@ -1971,18 +2203,20 @@ function buildReportsData(reportRange, unit, agent) {
   // Ticket volume per bucket across the selected range, zero-filled so a
   // quiet bucket shows as an actual zero-height bar, not a gap that's easy
   // to misread as missing data.
-  const volumeRows = db
+  const volumeRows = await db
     .prepare(`SELECT ${bucketExpr} AS bucket, COUNT(*) AS count FROM tickets WHERE ${rangeWhere}${vis.sql} GROUP BY bucket`)
     .all(...rangeParams, ...vis.params);
-  const volumeByBucket = Object.fromEntries(volumeRows.map((r) => [r.bucket, r.count]));
+  const volumeByBucket = Object.fromEntries(volumeRows.map((r) => [r.bucket, Number(r.count)]));
   const volume = bucketKeys.map((bucket) => ({ day: bucket, count: volumeByBucket[bucket] || 0 }));
 
-  const byCategory = db
+  const byCategoryRaw = await db
     .prepare(`SELECT category AS label, COUNT(*) AS count FROM tickets WHERE ${rangeWhere}${vis.sql} GROUP BY category ORDER BY count DESC`)
     .all(...rangeParams, ...vis.params);
-  const byStatus = db
+  const byCategory = byCategoryRaw.map((r) => ({ ...r, count: Number(r.count) }));
+  const byStatusRaw = await db
     .prepare(`SELECT status AS label, COUNT(*) AS count FROM tickets WHERE ${rangeWhere}${vis.sql} GROUP BY status ORDER BY count DESC`)
     .all(...rangeParams, ...vis.params);
+  const byStatus = byStatusRaw.map((r) => ({ ...r, count: Number(r.count) }));
 
   // Cross-department volume - meaningful for an admin (who can compare
   // departments against each other); for a non-admin it's scoped like
@@ -1990,31 +2224,33 @@ function buildReportsData(reportRange, unit, agent) {
   // Derives the department from category via the categories table rather
   // than a stored column on tickets, same as every other department lookup
   // in this app.
-  const byDepartment = db
+  const byDepartmentRaw = await db
     .prepare(
       `SELECT COALESCE(departments.name, 'Unknown') AS label, COUNT(*) AS count
        FROM tickets
        LEFT JOIN categories ON categories.name = tickets.category
        LEFT JOIN departments ON departments.id = categories.department_id
-       WHERE tickets.created_at >= ? AND tickets.created_at < date(?, '+1 day')${vis.sql}
-       GROUP BY departments.id
+       WHERE tickets.created_at >= ? AND tickets.created_at < (?::date + INTERVAL '1 day')::text${vis.sql}
+       GROUP BY departments.id, departments.name
        ORDER BY count DESC`
     )
     .all(...rangeParams, ...vis.params);
+  const byDepartment = byDepartmentRaw.map((r) => ({ ...r, count: Number(r.count) }));
 
   // Current workload deliberately ignores the selected report range - it's
   // a live "who has what open right now" snapshot, not a historical count,
   // so picking "Last 7 days" shouldn't hide someone's older backlog.
-  const byAgent = db
+  const byAgentRaw = await db
     .prepare(
       `SELECT COALESCE(agents.name, 'Unassigned') AS label, COUNT(*) AS count
        FROM tickets
        LEFT JOIN agents ON agents.id = tickets.assigned_to
        WHERE tickets.status IN ('Open', 'In Progress')${vis.sql}
-       GROUP BY tickets.assigned_to
+       GROUP BY tickets.assigned_to, agents.name
        ORDER BY count DESC`
     )
     .all(...vis.params);
+  const byAgent = byAgentRaw.map((r) => ({ ...r, count: Number(r.count) }));
 
   // Department capacity: open (Open/In Progress) ticket count vs active,
   // non-admin agent count, per department, right now - same "live snapshot,
@@ -2030,7 +2266,7 @@ function buildReportsData(reportRange, unit, agent) {
   const departmentCapacityWhere =
     agent && agent.is_admin ? " WHERE departments.active = 1" : " WHERE departments.active = 1 AND departments.id = ?";
   const departmentCapacityParams = agent && agent.is_admin ? [] : [agent && agent.department_id];
-  const departmentCapacityRaw = db
+  const departmentCapacityRaw = await db
     .prepare(
       `SELECT departments.name AS label,
               (SELECT COUNT(*) FROM tickets
@@ -2043,8 +2279,13 @@ function buildReportsData(reportRange, unit, agent) {
        ORDER BY departments.name`
     )
     .all(...departmentCapacityParams);
-  const capacityOpenMax = Math.max(1, ...departmentCapacityRaw.map((r) => r.open_count));
-  const departmentCapacity = departmentCapacityRaw.map((r) => ({
+  const departmentCapacityCounted = departmentCapacityRaw.map((r) => ({
+    label: r.label,
+    open_count: Number(r.open_count),
+    agent_count: Number(r.agent_count),
+  }));
+  const capacityOpenMax = Math.max(1, ...departmentCapacityCounted.map((r) => r.open_count));
+  const departmentCapacity = departmentCapacityCounted.map((r) => ({
     label: r.label,
     openCount: r.open_count,
     agentCount: r.agent_count,
@@ -2061,17 +2302,23 @@ function buildReportsData(reportRange, unit, agent) {
   // at least one rating, rather than zero-filled: a 1-5 rating scale has no
   // sensible "0" to zero-fill with, since that would look identical to a
   // genuinely bad average rather than "nobody rated anything that bucket".
-  const csatBucketExpr = unit === "day" ? "date(ticket_ratings.created_at)" : "strftime('%Y-%m', ticket_ratings.created_at)";
-  const csatTrend = db
+  const csatBucketExpr =
+    unit === "day" ? "ticket_ratings.created_at::date::text" : "to_char(ticket_ratings.created_at::timestamp, 'YYYY-MM')";
+  const csatTrendRaw = await db
     .prepare(
       `SELECT ${csatBucketExpr} AS month, AVG(ticket_ratings.rating) AS avg_rating, COUNT(*) AS count
        FROM ticket_ratings
        JOIN tickets ON tickets.id = ticket_ratings.ticket_id
-       WHERE ticket_ratings.created_at >= ? AND ticket_ratings.created_at < date(?, '+1 day')${vis.sql}
+       WHERE ticket_ratings.created_at >= ? AND ticket_ratings.created_at < (?::date + INTERVAL '1 day')::text${vis.sql}
        GROUP BY month ORDER BY month`
     )
-    .all(...rangeParams, ...vis.params)
-    .map((r) => ({ ...r, barClass: barClass("bar-h", r.avg_rating, 5) }));
+    .all(...rangeParams, ...vis.params);
+  const csatTrend = csatTrendRaw.map((r) => ({
+    ...r,
+    avg_rating: Number(r.avg_rating),
+    count: Number(r.count),
+    barClass: barClass("bar-h", Number(r.avg_rating), 5),
+  }));
 
   // Per-agent breakdown, scoped to tickets actually RESOLVED within the
   // selected range (not created within it) - "how did each agent do during
@@ -2088,49 +2335,57 @@ function buildReportsData(reportRange, unit, agent) {
   // with all-zero stats.
   const agentDeptWhere = agent && agent.is_admin ? "" : " AND agents.department_id = ?";
   const agentDeptParams = agent && agent.is_admin ? [] : [agent && agent.department_id];
-  const agentPerformance = db
+  const agentPerformanceRaw = await db
     .prepare(
       `SELECT agents.name,
               COUNT(DISTINCT resolved.ticket_id) AS resolved_count,
-              AVG(julianday(resolved.happened) - julianday(tickets.created_at)) AS avg_resolution_days,
+              AVG(EXTRACT(EPOCH FROM (resolved.happened::timestamp - tickets.created_at::timestamp)) / 86400) AS avg_resolution_days,
               AVG(ticket_ratings.rating) AS avg_csat
        FROM agents
        LEFT JOIN tickets ON tickets.assigned_to = agents.id${vis.sql}
        LEFT JOIN (
          SELECT ticket_id, MAX(created_at) AS happened
          FROM ticket_activity
-         WHERE type = 'status_change' AND body LIKE '%to "Resolved".' AND created_at >= ? AND created_at < date(?, '+1 day')
+         WHERE type = 'status_change' AND body LIKE '%to "Resolved".' AND created_at >= ? AND created_at < (?::date + INTERVAL '1 day')::text
          GROUP BY ticket_id
        ) resolved ON resolved.ticket_id = tickets.id
        LEFT JOIN ticket_ratings ON ticket_ratings.ticket_id = tickets.id
        WHERE agents.active = 1${agentDeptWhere}
-       GROUP BY agents.id
+       GROUP BY agents.id, agents.name
        ORDER BY resolved_count DESC`
     )
     .all(...vis.params, ...rangeParams, ...agentDeptParams);
+  const agentPerformance = agentPerformanceRaw.map((r) => ({
+    ...r,
+    resolved_count: Number(r.resolved_count),
+    avg_resolution_days: r.avg_resolution_days == null ? null : Number(r.avg_resolution_days),
+    avg_csat: r.avg_csat == null ? null : Number(r.avg_csat),
+  }));
 
   // Reopen rate: of tickets resolved within the range, how many were later
   // reopened (either an agent manually moving it back, or the auto-reopen-
   // on-requester-reply in public.js - both leave a status_change activity
   // row reading "from Resolved/Closed to ...") - a rough proxy for "are we
   // actually fixing things".
-  const everResolvedCount = db
+  const everResolvedRow = await db
     .prepare(
       `SELECT COUNT(DISTINCT ticket_activity.ticket_id) AS c
        FROM ticket_activity JOIN tickets ON tickets.id = ticket_activity.ticket_id
        WHERE ticket_activity.type = 'status_change' AND ticket_activity.body LIKE '%to "Resolved".'
-         AND ticket_activity.created_at >= ? AND ticket_activity.created_at < date(?, '+1 day')${vis.sql}`
+         AND ticket_activity.created_at >= ? AND ticket_activity.created_at < (?::date + INTERVAL '1 day')::text${vis.sql}`
     )
-    .get(...rangeParams, ...vis.params).c;
-  const reopenedCount = db
+    .get(...rangeParams, ...vis.params);
+  const everResolvedCount = Number(everResolvedRow.c);
+  const reopenedRow = await db
     .prepare(
       `SELECT COUNT(DISTINCT ticket_activity.ticket_id) AS c
        FROM ticket_activity JOIN tickets ON tickets.id = ticket_activity.ticket_id
        WHERE ticket_activity.type = 'status_change'
          AND (ticket_activity.body LIKE '%from "Resolved" to%' OR ticket_activity.body LIKE '%from "Closed" to%')
-         AND ticket_activity.created_at >= ? AND ticket_activity.created_at < date(?, '+1 day')${vis.sql}`
+         AND ticket_activity.created_at >= ? AND ticket_activity.created_at < (?::date + INTERVAL '1 day')::text${vis.sql}`
     )
-    .get(...rangeParams, ...vis.params).c;
+    .get(...rangeParams, ...vis.params);
+  const reopenedCount = Number(reopenedRow.c);
   const reopenRate = everResolvedCount ? (reopenedCount / everResolvedCount) * 100 : null;
 
   // SLA compliance trend: of tickets resolved within the range, bucketed
@@ -2143,8 +2398,8 @@ function buildReportsData(reportRange, unit, agent) {
   // present-day cumulative value (exact for a ticket resolved once, an
   // approximation for one that later reopened, paused again, and
   // re-resolved before the range's own end date).
-  const slaBucketExpr = unit === "day" ? "date(resolved.happened)" : "strftime('%Y-%m', resolved.happened)";
-  const resolvedForSla = db
+  const slaBucketExpr = unit === "day" ? "resolved.happened::date::text" : "to_char(resolved.happened::timestamp, 'YYYY-MM')";
+  const resolvedForSla = await db
     .prepare(
       `SELECT tickets.priority, tickets.created_at, tickets.paused_hours, resolved.happened AS resolved_at,
               ${slaBucketExpr} AS bucket
@@ -2155,16 +2410,16 @@ function buildReportsData(reportRange, unit, agent) {
          WHERE type = 'status_change' AND body LIKE '%to "Resolved".'
          GROUP BY ticket_id
        ) resolved ON resolved.ticket_id = tickets.id
-       WHERE resolved.happened >= ? AND resolved.happened < date(?, '+1 day')${vis.sql}`
+       WHERE resolved.happened >= ? AND resolved.happened < (?::date + INTERVAL '1 day')::text${vis.sql}`
     )
     .all(...rangeParams, ...vis.params);
 
-  const slaThresholds = currentThresholds();
+  const slaThresholds = await currentThresholds();
   const slaBuckets = {};
   for (const t of resolvedForSla) {
     const created = new Date(`${t.created_at.replace(" ", "T")}Z`);
     const resolvedAt = new Date(`${t.resolved_at.replace(" ", "T")}Z`);
-    const hours = Math.max(0, businessHoursElapsed(created, resolvedAt) - (t.paused_hours || 0));
+    const hours = Math.max(0, (await businessHoursElapsed(created, resolvedAt)) - (t.paused_hours || 0));
     const thresholdDays = slaThresholds[t.priority] ?? FALLBACK_DAYS;
     const met = hours <= thresholdDays * BUSINESS_HOURS_PER_DAY;
     if (!slaBuckets[t.bucket]) slaBuckets[t.bucket] = { met: 0, total: 0 };
@@ -2183,9 +2438,9 @@ function buildReportsData(reportRange, unit, agent) {
   // matched against logged_on (when the work happened) rather than the
   // ticket's own created_at - a ticket opened months ago but worked on
   // during this window should still show up here.
-  const timeByAgent = timeEntries.summaryByAgent(from, to, vis);
-  const timeByTicket = timeEntries.summaryByTicket(from, to, vis);
-  const totalTimeMinutes = timeEntries.totalMinutesInRange(from, to, vis);
+  const timeByAgent = await timeEntries.summaryByAgent(from, to, vis);
+  const timeByTicket = await timeEntries.summaryByTicket(from, to, vis);
+  const totalTimeMinutes = await timeEntries.totalMinutesInRange(from, to, vis);
 
   return {
     volume: volume.map((v) => ({ ...v, barClass: barClass("bar-h", v.count, volumeMax) })),
@@ -2207,53 +2462,61 @@ function buildReportsData(reportRange, unit, agent) {
   };
 }
 
-router.get("/settings", (req, res) => {
-  res.render("dashboard/settings", {
-    title: "Settings",
-    thresholds: currentThresholds(),
-    frThresholds: currentFirstResponseThresholds(),
-    priorities: PRIORITIES,
-    error: null,
-  });
+router.get("/settings", async (req, res, next) => {
+  try {
+    res.render("dashboard/settings", {
+      title: "Settings",
+      thresholds: await currentThresholds(),
+      frThresholds: await currentFirstResponseThresholds(),
+      priorities: PRIORITIES,
+      error: null,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/settings", verifyCsrf, (req, res) => {
-  const errors = [];
-  const parsed = {};
-  for (const priority of PRIORITIES) {
-    const days = parseInt(req.body[`days_${priority}`], 10);
-    if (!Number.isInteger(days) || days < 1 || days > 365) {
-      errors.push(`${priority} must be a whole number of days between 1 and 365.`);
-      continue;
+router.post("/settings", verifyCsrf, async (req, res, next) => {
+  try {
+    const errors = [];
+    const parsed = {};
+    for (const priority of PRIORITIES) {
+      const days = parseInt(req.body[`days_${priority}`], 10);
+      if (!Number.isInteger(days) || days < 1 || days > 365) {
+        errors.push(`${priority} must be a whole number of days between 1 and 365.`);
+        continue;
+      }
+      parsed[priority] = days;
     }
-    parsed[priority] = days;
-  }
 
-  const parsedFr = {};
-  for (const priority of PRIORITIES) {
-    const hours = parseInt(req.body[`fr_hours_${priority}`], 10);
-    if (!Number.isInteger(hours) || hours < 1 || hours > 720) {
-      errors.push(`${priority}'s first-response target must be a whole number of hours between 1 and 720.`);
-      continue;
+    const parsedFr = {};
+    for (const priority of PRIORITIES) {
+      const hours = parseInt(req.body[`fr_hours_${priority}`], 10);
+      if (!Number.isInteger(hours) || hours < 1 || hours > 720) {
+        errors.push(`${priority}'s first-response target must be a whole number of hours between 1 and 720.`);
+        continue;
+      }
+      parsedFr[priority] = hours;
     }
-    parsedFr[priority] = hours;
-  }
 
-  if (errors.length) {
-    return res.status(400).render("dashboard/settings", {
-      title: "Settings",
-      thresholds: currentThresholds(),
-      frThresholds: currentFirstResponseThresholds(),
-      priorities: PRIORITIES,
-      error: errors.join(" "),
-    });
-  }
+    if (errors.length) {
+      return res.status(400).render("dashboard/settings", {
+        title: "Settings",
+        thresholds: await currentThresholds(),
+        frThresholds: await currentFirstResponseThresholds(),
+        priorities: PRIORITIES,
+        error: errors.join(" "),
+      });
+    }
 
-  const update = db.prepare("UPDATE sla_thresholds SET days = ? WHERE priority = ?");
-  for (const [priority, days] of Object.entries(parsed)) update.run(days, priority);
-  const updateFr = db.prepare("UPDATE first_response_thresholds SET hours = ? WHERE priority = ?");
-  for (const [priority, hours] of Object.entries(parsedFr)) updateFr.run(hours, priority);
-  res.redirect("/dashboard/settings");
+    const update = db.prepare("UPDATE sla_thresholds SET days = ? WHERE priority = ?");
+    for (const [priority, days] of Object.entries(parsed)) await update.run(days, priority);
+    const updateFr = db.prepare("UPDATE first_response_thresholds SET hours = ? WHERE priority = ?");
+    for (const [priority, hours] of Object.entries(parsedFr)) await updateFr.run(hours, priority);
+    res.redirect("/dashboard/settings");
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Optional TOTP two-factor login (see src/totp.js) - an agent's own account
@@ -2265,8 +2528,8 @@ router.post("/settings", verifyCsrf, (req, res) => {
 // totp_enabled. The secret lives only in the session until that
 // verification succeeds - a secret nobody's confirmed they can generate
 // codes for would just lock the agent out the moment it went live.
-function renderSecurityPage(req, res, { status = 200, error = null, notice = null } = {}) {
-  const agent = db.prepare("SELECT totp_enabled FROM agents WHERE id = ?").get(req.session.agentId);
+async function renderSecurityPage(req, res, { status = 200, error = null, notice = null } = {}) {
+  const agent = await db.prepare("SELECT totp_enabled FROM agents WHERE id = ?").get(req.session.agentId);
   const pendingSecret = req.session.totpSetupSecret || null;
   res.status(status).render("dashboard/security", {
     title: "Two-factor authentication",
@@ -2278,17 +2541,25 @@ function renderSecurityPage(req, res, { status = 200, error = null, notice = nul
   });
 }
 
-router.get("/settings/security", (req, res) => {
-  renderSecurityPage(req, res);
+router.get("/settings/security", async (req, res, next) => {
+  try {
+    await renderSecurityPage(req, res);
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/settings/security/2fa/setup", verifyCsrf, (req, res) => {
-  // Already on - nothing to (re-)set up until it's turned off first, which
-  // would otherwise let a stray double-submit generate (and show) a fresh
-  // secret while the old one is still the one actually protecting login.
-  if (res.locals.currentAgent.totp_enabled) return res.redirect("/dashboard/settings/security");
-  req.session.totpSetupSecret = totp.generateSecret();
-  res.redirect("/dashboard/settings/security");
+router.post("/settings/security/2fa/setup", verifyCsrf, async (req, res, next) => {
+  try {
+    // Already on - nothing to (re-)set up until it's turned off first, which
+    // would otherwise let a stray double-submit generate (and show) a fresh
+    // secret while the old one is still the one actually protecting login.
+    if (res.locals.currentAgent.totp_enabled) return res.redirect("/dashboard/settings/security");
+    req.session.totpSetupSecret = totp.generateSecret();
+    res.redirect("/dashboard/settings/security");
+  } catch (err) {
+    next(err);
+  }
 });
 
 router.post("/settings/security/2fa/cancel", verifyCsrf, (req, res) => {
@@ -2296,29 +2567,37 @@ router.post("/settings/security/2fa/cancel", verifyCsrf, (req, res) => {
   res.redirect("/dashboard/settings/security");
 });
 
-router.post("/settings/security/2fa/verify", verifyCsrf, (req, res) => {
-  const pendingSecret = req.session.totpSetupSecret;
-  if (!pendingSecret) return res.redirect("/dashboard/settings/security");
+router.post("/settings/security/2fa/verify", verifyCsrf, async (req, res, next) => {
+  try {
+    const pendingSecret = req.session.totpSetupSecret;
+    if (!pendingSecret) return res.redirect("/dashboard/settings/security");
 
-  if (!totp.verifyToken(pendingSecret, req.body.code || "")) {
-    return renderSecurityPage(req, res, { status: 400, error: "That code didn't match. Check your device's clock and try again." });
+    if (!totp.verifyToken(pendingSecret, req.body.code || "")) {
+      return renderSecurityPage(req, res, { status: 400, error: "That code didn't match. Check your device's clock and try again." });
+    }
+
+    await db.prepare("UPDATE agents SET totp_secret = ?, totp_enabled = 1 WHERE id = ?").run(pendingSecret, req.session.agentId);
+    delete req.session.totpSetupSecret;
+    await renderSecurityPage(req, res, { notice: "Two-factor authentication is now on for your account." });
+  } catch (err) {
+    next(err);
   }
-
-  db.prepare("UPDATE agents SET totp_secret = ?, totp_enabled = 1 WHERE id = ?").run(pendingSecret, req.session.agentId);
-  delete req.session.totpSetupSecret;
-  renderSecurityPage(req, res, { notice: "Two-factor authentication is now on for your account." });
 });
 
 // Disabling requires the agent's current password, not just an active
 // session - a live session alone being enough to turn off the second
 // factor protecting it would defeat most of the point of having one.
-router.post("/settings/security/2fa/disable", verifyCsrf, (req, res) => {
-  const agent = db.prepare("SELECT id, password_hash FROM agents WHERE id = ?").get(req.session.agentId);
-  if (!bcrypt.compareSync(req.body.password || "", agent.password_hash)) {
-    return renderSecurityPage(req, res, { status: 400, error: "Incorrect password." });
+router.post("/settings/security/2fa/disable", verifyCsrf, async (req, res, next) => {
+  try {
+    const agent = await db.prepare("SELECT id, password_hash FROM agents WHERE id = ?").get(req.session.agentId);
+    if (!bcrypt.compareSync(req.body.password || "", agent.password_hash)) {
+      return renderSecurityPage(req, res, { status: 400, error: "Incorrect password." });
+    }
+    await db.prepare("UPDATE agents SET totp_secret = NULL, totp_enabled = 0 WHERE id = ?").run(agent.id);
+    await renderSecurityPage(req, res, { notice: "Two-factor authentication has been turned off." });
+  } catch (err) {
+    next(err);
   }
-  db.prepare("UPDATE agents SET totp_secret = NULL, totp_enabled = 0 WHERE id = ?").run(agent.id);
-  renderSecurityPage(req, res, { notice: "Two-factor authentication has been turned off." });
 });
 
 // Departments + their categories (see src/departments.js) - the
@@ -2328,52 +2607,72 @@ router.post("/settings/security/2fa/disable", verifyCsrf, (req, res) => {
 // via `active`, same pattern as agents/assets/holidays) - a category or
 // department already referenced by real tickets/agents can't be yanked out
 // from under them.
-router.get("/settings/departments", (req, res) => {
-  res.render("dashboard/departments", {
-    title: "Departments & categories",
-    departmentsList: departments.allIncludingInactive(),
-    categoriesList: departments.allCategoriesIncludingInactive(),
-    error: null,
-  });
-});
-
-router.post("/settings/departments", verifyCsrf, (req, res) => {
-  const result = departments.create(req.body.name);
-  if (result.error) {
-    return res.status(400).render("dashboard/departments", {
+router.get("/settings/departments", async (req, res, next) => {
+  try {
+    res.render("dashboard/departments", {
       title: "Departments & categories",
-      departmentsList: departments.allIncludingInactive(),
-      categoriesList: departments.allCategoriesIncludingInactive(),
-      error: result.error,
+      departmentsList: await departments.allIncludingInactive(),
+      categoriesList: await departments.allCategoriesIncludingInactive(),
+      error: null,
     });
+  } catch (err) {
+    next(err);
   }
-  res.redirect("/dashboard/settings/departments");
 });
 
-router.post("/settings/departments/:id/toggle", verifyCsrf, (req, res) => {
-  const row = departments.get(req.params.id);
-  if (row) departments.setActive(row.id, !row.active);
-  res.redirect("/dashboard/settings/departments");
-});
-
-router.post("/settings/departments/categories", verifyCsrf, (req, res) => {
-  const departmentId = parseInt(req.body.department_id, 10);
-  const result = departments.createCategory(req.body.name, departmentId);
-  if (result.error) {
-    return res.status(400).render("dashboard/departments", {
-      title: "Departments & categories",
-      departmentsList: departments.allIncludingInactive(),
-      categoriesList: departments.allCategoriesIncludingInactive(),
-      error: result.error,
-    });
+router.post("/settings/departments", verifyCsrf, async (req, res, next) => {
+  try {
+    const result = await departments.create(req.body.name);
+    if (result.error) {
+      return res.status(400).render("dashboard/departments", {
+        title: "Departments & categories",
+        departmentsList: await departments.allIncludingInactive(),
+        categoriesList: await departments.allCategoriesIncludingInactive(),
+        error: result.error,
+      });
+    }
+    res.redirect("/dashboard/settings/departments");
+  } catch (err) {
+    next(err);
   }
-  res.redirect("/dashboard/settings/departments");
 });
 
-router.post("/settings/departments/categories/:id/toggle", verifyCsrf, (req, res) => {
-  const row = db.prepare("SELECT active FROM categories WHERE id = ?").get(req.params.id);
-  if (row) departments.setCategoryActive(req.params.id, !row.active);
-  res.redirect("/dashboard/settings/departments");
+router.post("/settings/departments/:id/toggle", verifyCsrf, async (req, res, next) => {
+  try {
+    const row = await departments.get(req.params.id);
+    if (row) await departments.setActive(row.id, !row.active);
+    res.redirect("/dashboard/settings/departments");
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/settings/departments/categories", verifyCsrf, async (req, res, next) => {
+  try {
+    const departmentId = parseInt(req.body.department_id, 10);
+    const result = await departments.createCategory(req.body.name, departmentId);
+    if (result.error) {
+      return res.status(400).render("dashboard/departments", {
+        title: "Departments & categories",
+        departmentsList: await departments.allIncludingInactive(),
+        categoriesList: await departments.allCategoriesIncludingInactive(),
+        error: result.error,
+      });
+    }
+    res.redirect("/dashboard/settings/departments");
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/settings/departments/categories/:id/toggle", verifyCsrf, async (req, res, next) => {
+  try {
+    const row = await db.prepare("SELECT active FROM categories WHERE id = ?").get(req.params.id);
+    if (row) await departments.setCategoryActive(req.params.id, !row.active);
+    res.redirect("/dashboard/settings/departments");
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Toggles the approval gate (src/departments.js's categoryRequiresApproval)
@@ -2382,88 +2681,120 @@ router.post("/settings/departments/categories/:id/toggle", verifyCsrf, (req, res
 // requireAdmin above). Flipping it on doesn't touch any ticket already in
 // flight under that category; flipping it off leaves a ticket already
 // pending exactly where it is, awaiting an admin's approve/reject.
-router.post("/settings/departments/categories/:id/approval-toggle", verifyCsrf, (req, res) => {
-  const row = db.prepare("SELECT requires_approval FROM categories WHERE id = ?").get(req.params.id);
-  if (row) departments.setCategoryRequiresApproval(req.params.id, !row.requires_approval);
-  res.redirect("/dashboard/settings/departments");
-});
-
-router.get("/settings/custom-fields", (req, res) => {
-  res.render("dashboard/custom-fields", {
-    title: "Custom fields",
-    definitions: customFields.allDefinitions(),
-    categories: departments.categoryNames(),
-    error: null,
-  });
-});
-
-router.post("/settings/custom-fields", verifyCsrf, (req, res) => {
-  const { category, field_name } = req.body;
-  if (!departments.isValidCategoryName(category)) {
-    return res.status(400).render("dashboard/custom-fields", {
-      title: "Custom fields",
-      definitions: customFields.allDefinitions(),
-      categories: departments.categoryNames(),
-      error: "Choose a valid category.",
-    });
+router.post("/settings/departments/categories/:id/approval-toggle", verifyCsrf, async (req, res, next) => {
+  try {
+    const row = await db.prepare("SELECT requires_approval FROM categories WHERE id = ?").get(req.params.id);
+    if (row) await departments.setCategoryRequiresApproval(req.params.id, !row.requires_approval);
+    res.redirect("/dashboard/settings/departments");
+  } catch (err) {
+    next(err);
   }
-  const result = customFields.create(category, field_name);
-  if (result.error) {
-    return res.status(400).render("dashboard/custom-fields", {
+});
+
+router.get("/settings/custom-fields", async (req, res, next) => {
+  try {
+    res.render("dashboard/custom-fields", {
       title: "Custom fields",
-      definitions: customFields.allDefinitions(),
-      categories: departments.categoryNames(),
-      error: result.error,
+      definitions: await customFields.allDefinitions(),
+      categories: await departments.categoryNames(),
+      error: null,
     });
+  } catch (err) {
+    next(err);
   }
-  res.redirect("/dashboard/settings/custom-fields");
 });
 
-router.post("/settings/custom-fields/:id/delete", verifyCsrf, (req, res) => {
-  customFields.remove(req.params.id);
-  res.redirect("/dashboard/settings/custom-fields");
+router.post("/settings/custom-fields", verifyCsrf, async (req, res, next) => {
+  try {
+    const { category, field_name } = req.body;
+    if (!(await departments.isValidCategoryName(category))) {
+      return res.status(400).render("dashboard/custom-fields", {
+        title: "Custom fields",
+        definitions: await customFields.allDefinitions(),
+        categories: await departments.categoryNames(),
+        error: "Choose a valid category.",
+      });
+    }
+    const result = await customFields.create(category, field_name);
+    if (result.error) {
+      return res.status(400).render("dashboard/custom-fields", {
+        title: "Custom fields",
+        definitions: await customFields.allDefinitions(),
+        categories: await departments.categoryNames(),
+        error: result.error,
+      });
+    }
+    res.redirect("/dashboard/settings/custom-fields");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/settings/automation", (req, res) => {
-  res.render("dashboard/automation", {
-    title: "Automation rules",
-    rules: automation.all(),
-    categories: departments.categoryNames(),
-    priorities: PRIORITIES,
-    agents: db.prepare("SELECT id, name FROM agents WHERE active = 1 ORDER BY name").all(),
-    departmentsList: departments.all(),
-    error: null,
-  });
+router.post("/settings/custom-fields/:id/delete", verifyCsrf, async (req, res, next) => {
+  try {
+    await customFields.remove(req.params.id);
+    res.redirect("/dashboard/settings/custom-fields");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/settings/automation", verifyCsrf, (req, res) => {
-  const result = automation.create(req.body);
-  if (result.error) {
-    return res.status(400).render("dashboard/automation", {
+router.get("/settings/automation", async (req, res, next) => {
+  try {
+    res.render("dashboard/automation", {
       title: "Automation rules",
-      rules: automation.all(),
-      categories: departments.categoryNames(),
+      rules: await automation.all(),
+      categories: await departments.categoryNames(),
       priorities: PRIORITIES,
-      agents: db.prepare("SELECT id, name FROM agents WHERE active = 1 ORDER BY name").all(),
-      departmentsList: departments.all(),
-      error: result.error,
+      agents: await db.prepare("SELECT id, name FROM agents WHERE active = 1 ORDER BY name").all(),
+      departmentsList: await departments.all(),
+      error: null,
     });
+  } catch (err) {
+    next(err);
   }
-  res.redirect("/dashboard/settings/automation");
 });
 
-router.post("/settings/automation/:id/toggle", verifyCsrf, (req, res) => {
-  const row = db.prepare("SELECT active FROM automation_rules WHERE id = ?").get(req.params.id);
-  if (row) automation.setActive(req.params.id, !row.active);
-  res.redirect("/dashboard/settings/automation");
+router.post("/settings/automation", verifyCsrf, async (req, res, next) => {
+  try {
+    const result = await automation.create(req.body);
+    if (result.error) {
+      return res.status(400).render("dashboard/automation", {
+        title: "Automation rules",
+        rules: await automation.all(),
+        categories: await departments.categoryNames(),
+        priorities: PRIORITIES,
+        agents: await db.prepare("SELECT id, name FROM agents WHERE active = 1 ORDER BY name").all(),
+        departmentsList: await departments.all(),
+        error: result.error,
+      });
+    }
+    res.redirect("/dashboard/settings/automation");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/settings/automation/:id/delete", verifyCsrf, (req, res) => {
-  automation.remove(req.params.id);
-  res.redirect("/dashboard/settings/automation");
+router.post("/settings/automation/:id/toggle", verifyCsrf, async (req, res, next) => {
+  try {
+    const row = await db.prepare("SELECT active FROM automation_rules WHERE id = ?").get(req.params.id);
+    if (row) await automation.setActive(req.params.id, !row.active);
+    res.redirect("/dashboard/settings/automation");
+  } catch (err) {
+    next(err);
+  }
 });
 
-function webhooksForDashboard() {
+router.post("/settings/automation/:id/delete", verifyCsrf, async (req, res, next) => {
+  try {
+    await automation.remove(req.params.id);
+    res.redirect("/dashboard/settings/automation");
+  } catch (err) {
+    next(err);
+  }
+});
+
+async function webhooksForDashboard() {
   return db
     .prepare(
       `SELECT webhooks.*, departments.name AS department_name
@@ -2473,123 +2804,156 @@ function webhooksForDashboard() {
     .all();
 }
 
-router.get("/settings/webhooks", (req, res) => {
-  res.render("dashboard/webhooks", {
-    title: "Webhooks",
-    webhooks: webhooksForDashboard(),
-    events: WEBHOOK_EVENTS,
-    departmentsList: departments.all(),
-    error: null,
-  });
-});
-
-router.post("/settings/webhooks", verifyCsrf, (req, res) => {
-  const url = (req.body.url || "").trim();
-  const events = Array.isArray(req.body.events) ? req.body.events : req.body.events ? [req.body.events] : [];
-  const validEvents = events.filter((e) => WEBHOOK_EVENTS.includes(e));
-  const departmentId = req.body.department_id ? parseInt(req.body.department_id, 10) : null;
-
-  let parsedUrl;
+router.get("/settings/webhooks", async (req, res, next) => {
   try {
-    parsedUrl = new URL(url);
-  } catch {
-    parsedUrl = null;
-  }
-
-  if (!parsedUrl || !["http:", "https:"].includes(parsedUrl.protocol) || !validEvents.length) {
-    return res.status(400).render("dashboard/webhooks", {
+    res.render("dashboard/webhooks", {
       title: "Webhooks",
-      webhooks: webhooksForDashboard(),
+      webhooks: await webhooksForDashboard(),
       events: WEBHOOK_EVENTS,
-      departmentsList: departments.all(),
-      error: "Enter a valid http(s) URL and choose at least one event.",
+      departmentsList: await departments.all(),
+      error: null,
     });
+  } catch (err) {
+    next(err);
   }
-
-  db.prepare("INSERT INTO webhooks (url, events, secret, department_id) VALUES (?, ?, ?, ?)").run(
-    url,
-    validEvents.join(","),
-    generateSecret(),
-    departmentId
-  );
-  res.redirect("/dashboard/settings/webhooks");
 });
 
-router.post("/settings/webhooks/:id/toggle", verifyCsrf, (req, res) => {
-  db.prepare("UPDATE webhooks SET active = 1 - active WHERE id = ?").run(req.params.id);
-  res.redirect("/dashboard/settings/webhooks");
+router.post("/settings/webhooks", verifyCsrf, async (req, res, next) => {
+  try {
+    const url = (req.body.url || "").trim();
+    const events = Array.isArray(req.body.events) ? req.body.events : req.body.events ? [req.body.events] : [];
+    const validEvents = events.filter((e) => WEBHOOK_EVENTS.includes(e));
+    const departmentId = req.body.department_id ? parseInt(req.body.department_id, 10) : null;
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      parsedUrl = null;
+    }
+
+    if (!parsedUrl || !["http:", "https:"].includes(parsedUrl.protocol) || !validEvents.length) {
+      return res.status(400).render("dashboard/webhooks", {
+        title: "Webhooks",
+        webhooks: await webhooksForDashboard(),
+        events: WEBHOOK_EVENTS,
+        departmentsList: await departments.all(),
+        error: "Enter a valid http(s) URL and choose at least one event.",
+      });
+    }
+
+    await db
+      .prepare("INSERT INTO webhooks (url, events, secret, department_id) VALUES (?, ?, ?, ?)")
+      .run(url, validEvents.join(","), generateSecret(), departmentId);
+    res.redirect("/dashboard/settings/webhooks");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/settings/webhooks/:id/delete", verifyCsrf, (req, res) => {
-  db.prepare("DELETE FROM webhooks WHERE id = ?").run(req.params.id);
-  res.redirect("/dashboard/settings/webhooks");
+router.post("/settings/webhooks/:id/toggle", verifyCsrf, async (req, res, next) => {
+  try {
+    await db.prepare("UPDATE webhooks SET active = 1 - active WHERE id = ?").run(req.params.id);
+    res.redirect("/dashboard/settings/webhooks");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/settings/login-log", (req, res) => {
-  const entries = db
-    .prepare(
-      `SELECT login_log.*, agents.name AS agent_name
-       FROM login_log
-       LEFT JOIN agents ON agents.id = login_log.agent_id
-       ORDER BY login_log.created_at DESC
-       LIMIT 200`
-    )
-    .all();
-  // Admin actions on another agent's account (today: 2FA resets - see
-  // POST /agents/:id/reset-2fa below) shown alongside login attempts on
-  // this same page, rather than a separate one - both are "security events
-  // involving an agent account" audit trails, and this app already treats
-  // this page as the place to look for that.
-  const agentActivity = db
-    .prepare(
-      `SELECT agent_activity.*, target.name AS target_name, actor.name AS actor_name
-       FROM agent_activity
-       LEFT JOIN agents target ON target.id = agent_activity.target_agent_id
-       LEFT JOIN agents actor ON actor.id = agent_activity.actor_agent_id
-       ORDER BY agent_activity.created_at DESC
-       LIMIT 200`
-    )
-    .all();
-  res.render("dashboard/login-log", { title: "Login activity", entries, agentActivity });
+router.post("/settings/webhooks/:id/delete", verifyCsrf, async (req, res, next) => {
+  try {
+    await db.prepare("DELETE FROM webhooks WHERE id = ?").run(req.params.id);
+    res.redirect("/dashboard/settings/webhooks");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/settings/holidays", (req, res) => {
-  res.render("dashboard/holidays", {
-    title: "Company holidays",
-    holidays: holidays.listHolidays(),
-    error: null,
-  });
+router.get("/settings/login-log", async (req, res, next) => {
+  try {
+    const entries = await db
+      .prepare(
+        `SELECT login_log.*, agents.name AS agent_name
+         FROM login_log
+         LEFT JOIN agents ON agents.id = login_log.agent_id
+         ORDER BY login_log.created_at DESC
+         LIMIT 200`
+      )
+      .all();
+    // Admin actions on another agent's account (today: 2FA resets - see
+    // POST /agents/:id/reset-2fa below) shown alongside login attempts on
+    // this same page, rather than a separate one - both are "security events
+    // involving an agent account" audit trails, and this app already treats
+    // this page as the place to look for that.
+    const agentActivity = await db
+      .prepare(
+        `SELECT agent_activity.*, target.name AS target_name, actor.name AS actor_name
+         FROM agent_activity
+         LEFT JOIN agents target ON target.id = agent_activity.target_agent_id
+         LEFT JOIN agents actor ON actor.id = agent_activity.actor_agent_id
+         ORDER BY agent_activity.created_at DESC
+         LIMIT 200`
+      )
+      .all();
+    res.render("dashboard/login-log", { title: "Login activity", entries, agentActivity });
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/settings/holidays", verifyCsrf, (req, res) => {
-  const date = (req.body.date || "").trim();
-  const name = (req.body.name || "").trim().slice(0, 200);
-  const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date);
-
-  if (!validDate || !name) {
-    return res.status(400).render("dashboard/holidays", {
+router.get("/settings/holidays", async (req, res, next) => {
+  try {
+    res.render("dashboard/holidays", {
       title: "Company holidays",
-      holidays: holidays.listHolidays(),
-      error: "Enter a valid date and a name for the holiday.",
+      holidays: await holidays.listHolidays(),
+      error: null,
     });
+  } catch (err) {
+    next(err);
   }
-
-  holidays.addHoliday(date, name);
-  res.redirect("/dashboard/settings/holidays");
 });
 
-router.post("/settings/holidays/:id/delete", verifyCsrf, (req, res) => {
-  holidays.deleteHoliday(req.params.id);
-  res.redirect("/dashboard/settings/holidays");
+router.post("/settings/holidays", verifyCsrf, async (req, res, next) => {
+  try {
+    const date = (req.body.date || "").trim();
+    const name = (req.body.name || "").trim().slice(0, 200);
+    const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date);
+
+    if (!validDate || !name) {
+      return res.status(400).render("dashboard/holidays", {
+        title: "Company holidays",
+        holidays: await holidays.listHolidays(),
+        error: "Enter a valid date and a name for the holiday.",
+      });
+    }
+
+    await holidays.addHoliday(date, name);
+    res.redirect("/dashboard/settings/holidays");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.get("/settings/asset-sync", (req, res) => {
-  res.render("dashboard/asset-sync", {
-    title: "Asset inventory sync",
-    enabled: msGraph.isEnabled(),
-    runs: assetSync.recentRuns(),
-    error: null,
-  });
+router.post("/settings/holidays/:id/delete", verifyCsrf, async (req, res, next) => {
+  try {
+    await holidays.deleteHoliday(req.params.id);
+    res.redirect("/dashboard/settings/holidays");
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/settings/asset-sync", async (req, res, next) => {
+  try {
+    res.render("dashboard/asset-sync", {
+      title: "Asset inventory sync",
+      enabled: msGraph.isEnabled(),
+      runs: await assetSync.recentRuns(),
+      error: null,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Manual "sync now" - runs inline (a few hundred list items, well within a
@@ -2602,7 +2966,7 @@ router.post("/settings/asset-sync", verifyCsrf, async (req, res) => {
     return res.render("dashboard/asset-sync", {
       title: "Asset inventory sync",
       enabled: msGraph.isEnabled(),
-      runs: assetSync.recentRuns(),
+      runs: await assetSync.recentRuns(),
       error: err.message,
     });
   }
@@ -2612,7 +2976,7 @@ router.post("/settings/asset-sync", verifyCsrf, async (req, res) => {
 // department_name/is_admin are shown (and, below, editable) right on this
 // page per item 5 of the multi-department feature: admin is meant to be a
 // real, visible role, never a quiet default anyone ends up with.
-function agentsForList() {
+async function agentsForList() {
   return db
     .prepare(
       `SELECT agents.id, agents.name, agents.email, agents.active, agents.created_at,
@@ -2631,68 +2995,85 @@ function agentsForList() {
 // others via a stray POST.
 router.use("/agents", requireAdmin);
 
-router.get("/agents", async (req, res) => {
-  const agents = agentsForList();
-  // Directory enrichment (department/job title/phone, see src/directory.js)
-  // - looked up in parallel, one per agent, rather than one at a time.
-  const profiles = await Promise.all(agents.map((a) => directory.getProfile(a.email)));
-  agents.forEach((a, i) => (a.profile = profiles[i]));
-  res.render("dashboard/agents", { title: "Agents", agents, departmentsList: departments.all(), error: null });
+router.get("/agents", async (req, res, next) => {
+  try {
+    const agents = await agentsForList();
+    // Directory enrichment (department/job title/phone, see src/directory.js)
+    // - looked up in parallel, one per agent, rather than one at a time.
+    const profiles = await Promise.all(agents.map((a) => directory.getProfile(a.email)));
+    agents.forEach((a, i) => (a.profile = profiles[i]));
+    res.render("dashboard/agents", { title: "Agents", agents, departmentsList: await departments.all(), error: null });
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/agents", verifyCsrf, (req, res) => {
-  const { name = "", email = "", password = "" } = req.body;
-  const normalizedEmail = email.trim().toLowerCase();
-  const departmentId = req.body.department_id ? parseInt(req.body.department_id, 10) : null;
-  const isAdmin = req.body.is_admin ? 1 : 0;
+router.post("/agents", verifyCsrf, async (req, res, next) => {
+  try {
+    const { name = "", email = "", password = "" } = req.body;
+    const normalizedEmail = email.trim().toLowerCase();
+    const departmentId = req.body.department_id ? parseInt(req.body.department_id, 10) : null;
+    const isAdmin = req.body.is_admin ? 1 : 0;
 
-  const rerender = (error) =>
-    res.status(400).render("dashboard/agents", { title: "Agents", agents: agentsForList(), departmentsList: departments.all(), error });
+    const rerender = async (error) =>
+      res.status(400).render("dashboard/agents", {
+        title: "Agents",
+        agents: await agentsForList(),
+        departmentsList: await departments.all(),
+        error,
+      });
 
-  if (!name.trim() || !normalizedEmail || !password) {
-    return rerender("Name, email, and password are all required.");
-  }
-  if (!EMAIL_RE.test(normalizedEmail)) {
-    return rerender("Enter a valid email address.");
-  }
-  if (password.length < 8) {
-    return rerender("Password must be at least 8 characters.");
-  }
-  if (!departmentId || !departments.get(departmentId)) {
-    return rerender("Choose a valid department.");
-  }
-  const existing = db.prepare("SELECT id FROM agents WHERE email = ?").get(normalizedEmail);
-  if (existing) {
-    return rerender("An agent with that email already exists.");
-  }
+    if (!name.trim() || !normalizedEmail || !password) {
+      return await rerender("Name, email, and password are all required.");
+    }
+    if (!EMAIL_RE.test(normalizedEmail)) {
+      return await rerender("Enter a valid email address.");
+    }
+    if (password.length < 8) {
+      return await rerender("Password must be at least 8 characters.");
+    }
+    if (!departmentId || !(await departments.get(departmentId))) {
+      return await rerender("Choose a valid department.");
+    }
+    const existing = await db.prepare("SELECT id FROM agents WHERE email = ?").get(normalizedEmail);
+    if (existing) {
+      return await rerender("An agent with that email already exists.");
+    }
 
-  const passwordHash = bcrypt.hashSync(password, 12);
-  db.prepare("INSERT INTO agents (name, email, password_hash, department_id, is_admin) VALUES (?, ?, ?, ?, ?)").run(
-    name.trim(),
-    normalizedEmail,
-    passwordHash,
-    departmentId,
-    isAdmin
-  );
+    const passwordHash = bcrypt.hashSync(password, 12);
+    await db
+      .prepare("INSERT INTO agents (name, email, password_hash, department_id, is_admin) VALUES (?, ?, ?, ?, ?)")
+      .run(name.trim(), normalizedEmail, passwordHash, departmentId, isAdmin);
 
-  res.redirect("/dashboard/agents");
+    res.redirect("/dashboard/agents");
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Autosubmitting department/admin controls on the Agents table row (see
 // views/dashboard/agents.ejs's [data-autosubmit] + field.form.requestSubmit()
 // pattern) - saves on change without a separate "Save" click, same UX as an
 // inline picker anywhere else in this app.
-router.post("/agents/:id/department", verifyCsrf, (req, res) => {
-  const departmentId = req.body.department_id ? parseInt(req.body.department_id, 10) : null;
-  if (departmentId && departments.get(departmentId)) {
-    db.prepare("UPDATE agents SET department_id = ? WHERE id = ?").run(departmentId, req.params.id);
+router.post("/agents/:id/department", verifyCsrf, async (req, res, next) => {
+  try {
+    const departmentId = req.body.department_id ? parseInt(req.body.department_id, 10) : null;
+    if (departmentId && (await departments.get(departmentId))) {
+      await db.prepare("UPDATE agents SET department_id = ? WHERE id = ?").run(departmentId, req.params.id);
+    }
+    res.redirect("/dashboard/agents");
+  } catch (err) {
+    next(err);
   }
-  res.redirect("/dashboard/agents");
 });
 
-router.post("/agents/:id/admin", verifyCsrf, (req, res) => {
-  db.prepare("UPDATE agents SET is_admin = ? WHERE id = ?").run(req.body.is_admin ? 1 : 0, req.params.id);
-  res.redirect("/dashboard/agents");
+router.post("/agents/:id/admin", verifyCsrf, async (req, res, next) => {
+  try {
+    await db.prepare("UPDATE agents SET is_admin = ? WHERE id = ?").run(req.body.is_admin ? 1 : 0, req.params.id);
+    res.redirect("/dashboard/agents");
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Deactivated, never deleted (see the comment on the agents table in
@@ -2700,35 +3081,44 @@ router.post("/agents/:id/admin", verifyCsrf, (req, res) => {
 // and auto-assignment, but keeps their name on everything they've already
 // done. Guards against locking the dashboard out entirely: can't deactivate
 // yourself, and can't deactivate the last remaining active agent.
-router.post("/agents/:id/deactivate", verifyCsrf, (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  if (id === req.session.agentId) {
-    return res.status(400).render("dashboard/agents", {
-      title: "Agents",
-      agents: agentsForList(),
-      departmentsList: departments.all(),
-      error: "You can't deactivate your own account.",
-    });
-  }
+router.post("/agents/:id/deactivate", verifyCsrf, async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (id === req.session.agentId) {
+      return res.status(400).render("dashboard/agents", {
+        title: "Agents",
+        agents: await agentsForList(),
+        departmentsList: await departments.all(),
+        error: "You can't deactivate your own account.",
+      });
+    }
 
-  const activeCount = db.prepare("SELECT COUNT(*) AS c FROM agents WHERE active = 1").get().c;
-  const target = db.prepare("SELECT active FROM agents WHERE id = ?").get(id);
-  if (target && target.active && activeCount <= 1) {
-    return res.status(400).render("dashboard/agents", {
-      title: "Agents",
-      agents: agentsForList(),
-      departmentsList: departments.all(),
-      error: "Can't deactivate the last active agent - nobody would be able to log in.",
-    });
-  }
+    const activeCountRow = await db.prepare("SELECT COUNT(*) AS c FROM agents WHERE active = 1").get();
+    const activeCount = Number(activeCountRow.c);
+    const target = await db.prepare("SELECT active FROM agents WHERE id = ?").get(id);
+    if (target && target.active && activeCount <= 1) {
+      return res.status(400).render("dashboard/agents", {
+        title: "Agents",
+        agents: await agentsForList(),
+        departmentsList: await departments.all(),
+        error: "Can't deactivate the last active agent - nobody would be able to log in.",
+      });
+    }
 
-  db.prepare("UPDATE agents SET active = 0 WHERE id = ?").run(id);
-  res.redirect("/dashboard/agents");
+    await db.prepare("UPDATE agents SET active = 0 WHERE id = ?").run(id);
+    res.redirect("/dashboard/agents");
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post("/agents/:id/activate", verifyCsrf, (req, res) => {
-  db.prepare("UPDATE agents SET active = 1 WHERE id = ?").run(req.params.id);
-  res.redirect("/dashboard/agents");
+router.post("/agents/:id/activate", verifyCsrf, async (req, res, next) => {
+  try {
+    await db.prepare("UPDATE agents SET active = 1 WHERE id = ?").run(req.params.id);
+    res.redirect("/dashboard/agents");
+  } catch (err) {
+    next(err);
+  }
 });
 
 // The lost-device case: an agent with 2FA on who can no longer generate
@@ -2740,19 +3130,23 @@ router.post("/agents/:id/activate", verifyCsrf, (req, res) => {
 // after the fact who reset whose 2FA and when - the same audit reasoning as
 // ticket_activity/asset_activity, just for agent accounts instead of
 // tickets/assets.
-router.post("/agents/:id/reset-2fa", verifyCsrf, (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  const target = db.prepare("SELECT id, name, totp_enabled FROM agents WHERE id = ?").get(id);
-  if (!target) return res.redirect("/dashboard/agents");
+router.post("/agents/:id/reset-2fa", verifyCsrf, async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const target = await db.prepare("SELECT id, name, totp_enabled FROM agents WHERE id = ?").get(id);
+    if (!target) return res.redirect("/dashboard/agents");
 
-  if (target.totp_enabled) {
-    db.prepare("UPDATE agents SET totp_secret = NULL, totp_enabled = 0 WHERE id = ?").run(id);
-    db.prepare(
-      `INSERT INTO agent_activity (target_agent_id, actor_agent_id, body) VALUES (?, ?, ?)`
-    ).run(id, req.session.agentId, `${res.locals.currentAgent.name} reset two-factor authentication for ${target.name}.`);
+    if (target.totp_enabled) {
+      await db.prepare("UPDATE agents SET totp_secret = NULL, totp_enabled = 0 WHERE id = ?").run(id);
+      await db
+        .prepare(`INSERT INTO agent_activity (target_agent_id, actor_agent_id, body) VALUES (?, ?, ?)`)
+        .run(id, req.session.agentId, `${res.locals.currentAgent.name} reset two-factor authentication for ${target.name}.`);
+    }
+
+    res.redirect("/dashboard/agents");
+  } catch (err) {
+    next(err);
   }
-
-  res.redirect("/dashboard/agents");
 });
 
 module.exports = router;

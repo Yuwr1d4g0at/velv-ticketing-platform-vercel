@@ -20,8 +20,8 @@ const { isAgingTicket, agingHoursElapsed, currentFirstResponseThresholds, BUSINE
 const { sendSlaBreachEmail, sendFirstResponseBreachEmail } = require("./mailer");
 const notifications = require("./notifications");
 
-function checkSlaBreaches() {
-  const candidates = db
+async function checkSlaBreaches() {
+  const candidates = await db
     .prepare(
       `SELECT tickets.id, tickets.subject, tickets.priority, tickets.status, tickets.created_at,
               tickets.waiting_since, tickets.paused_hours, agents.id AS agent_id, agents.email AS agent_email
@@ -30,14 +30,15 @@ function checkSlaBreaches() {
        WHERE tickets.status IN ('Open', 'In Progress') AND tickets.sla_alerted_at IS NULL`
     )
     .all();
-  const breaching = candidates.filter((t) => isAgingTicket(t));
+  const aging = await Promise.all(candidates.map((t) => isAgingTicket(t)));
+  const breaching = candidates.filter((_, i) => aging[i]);
 
   for (const ticket of breaching) {
     // Business hours, not raw calendar hours - matches what actually
     // crossed the threshold (and excludes any time spent paused waiting on
     // the customer), rather than a wall-clock age that could read as "past
     // due" much sooner than the business-hours math actually says.
-    const ageDays = agingHoursElapsed(ticket) / BUSINESS_HOURS_PER_DAY;
+    const ageDays = (await agingHoursElapsed(ticket)) / BUSINESS_HOURS_PER_DAY;
     sendSlaBreachEmail({
       to: ticket.agent_email,
       ticketId: ticket.id,
@@ -45,8 +46,13 @@ function checkSlaBreaches() {
       priority: ticket.priority,
       ageDays,
     }).catch((err) => console.error("Could not send SLA breach email:", err.message));
-    notifications.create(ticket.agent_id, "sla_breach", ticket.id, `Ticket #${ticket.id} is past its aging threshold (${ticket.priority}).`);
-    db.prepare("UPDATE tickets SET sla_alerted_at = datetime('now') WHERE id = ?").run(ticket.id);
+    await notifications.create(
+      ticket.agent_id,
+      "sla_breach",
+      ticket.id,
+      `Ticket #${ticket.id} is past its aging threshold (${ticket.priority}).`
+    );
+    await db.prepare("UPDATE tickets SET sla_alerted_at = now_text() WHERE id = ?").run(ticket.id);
   }
 
   return breaching.length;
@@ -59,9 +65,9 @@ function checkSlaBreaches() {
 // (note, reply, status/priority change, reassignment) - "first response"
 // doesn't require a public reply specifically, just evidence someone's
 // looked at it.
-function checkFirstResponseBreaches() {
-  const thresholds = currentFirstResponseThresholds();
-  const candidates = db
+async function checkFirstResponseBreaches() {
+  const thresholds = await currentFirstResponseThresholds();
+  const candidates = await db
     .prepare(
       `SELECT tickets.id, tickets.subject, tickets.priority, tickets.status, tickets.created_at,
               tickets.waiting_since, tickets.paused_hours, agents.id AS agent_id, agents.email AS agent_email
@@ -75,9 +81,10 @@ function checkFirstResponseBreaches() {
     )
     .all();
 
-  const breaching = candidates.filter((t) => {
+  const hoursElapsed = await Promise.all(candidates.map((t) => agingHoursElapsed(t)));
+  const breaching = candidates.filter((t, i) => {
     const thresholdHours = thresholds[t.priority];
-    return thresholdHours != null && agingHoursElapsed(t) > thresholdHours;
+    return thresholdHours != null && hoursElapsed[i] > thresholdHours;
   });
 
   for (const ticket of breaching) {
@@ -87,8 +94,13 @@ function checkFirstResponseBreaches() {
       subject: ticket.subject,
       priority: ticket.priority,
     }).catch((err) => console.error("Could not send first-response breach email:", err.message));
-    notifications.create(ticket.agent_id, "first_response_breach", ticket.id, `Ticket #${ticket.id} still has no response (${ticket.priority}).`);
-    db.prepare("UPDATE tickets SET first_response_alerted_at = datetime('now') WHERE id = ?").run(ticket.id);
+    await notifications.create(
+      ticket.agent_id,
+      "first_response_breach",
+      ticket.id,
+      `Ticket #${ticket.id} still has no response (${ticket.priority}).`
+    );
+    await db.prepare("UPDATE tickets SET first_response_alerted_at = now_text() WHERE id = ?").run(ticket.id);
   }
 
   return breaching.length;

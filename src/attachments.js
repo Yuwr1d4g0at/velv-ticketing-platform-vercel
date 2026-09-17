@@ -98,25 +98,33 @@ function handleUpload(fieldName) {
 // attached to a note explicitly marked "visible to requester" - otherwise an
 // agent could attach something meant to stay internal to an otherwise-
 // internal note and have it leak via /status anyway.
-function saveAttachments({ ticketId, files, uploadedBy, agentId = null, visibleToRequester = true }) {
+// Ported to the async Postgres adapter (see src/db/index.js) - this is the
+// one DB call site in this file. The multer diskStorage setup above is
+// UNCHANGED for now (still local disk, still reads DB_PATH which no longer
+// exists in .env.example - falls back to its own hardcoded default, fine
+// for local dev/testing) - swapping this for Vercel Blob is Phase 3's job,
+// deliberately not bundled into this async-adapter pass.
+async function saveAttachments({ ticketId, files, uploadedBy, agentId = null, visibleToRequester = true }) {
   if (!files || !files.length) return [];
   const insert = db.prepare(
     `INSERT INTO attachments (ticket_id, stored_name, original_name, mime_type, size_bytes, uploaded_by, agent_id, visible_to_requester)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   );
-  return files.map((file) => {
-    const result = insert.run(
-      ticketId,
-      file.filename,
-      file.originalname.slice(0, 200),
-      file.mimetype,
-      file.size,
-      uploadedBy,
-      agentId,
-      visibleToRequester ? 1 : 0
-    );
-    return result.lastInsertRowid;
-  });
+  return Promise.all(
+    files.map(async (file) => {
+      const result = await insert.run(
+        ticketId,
+        file.filename,
+        file.originalname.slice(0, 200),
+        file.mimetype,
+        file.size,
+        uploadedBy,
+        agentId,
+        visibleToRequester ? 1 : 0
+      );
+      return result.lastInsertRowid;
+    })
+  );
 }
 
 function deleteUploadedFiles(files) {
@@ -128,7 +136,7 @@ function deleteUploadedFiles(files) {
 // requesterVisibleOnly: true for anything rendered on a public (/status)
 // page - false (the default) for the dashboard, where agents see everything
 // regardless of the visibility flag.
-function attachmentsForTicket(ticketId, { requesterVisibleOnly = false } = {}) {
+async function attachmentsForTicket(ticketId, { requesterVisibleOnly = false } = {}) {
   return db
     .prepare(
       `SELECT attachments.*, agents.name AS agent_name
@@ -142,20 +150,16 @@ function attachmentsForTicket(ticketId, { requesterVisibleOnly = false } = {}) {
 
 // For the agent-side download route: no visibility filter, agents can pull
 // any attachment on a ticket regardless of the flag.
-function getAttachment(ticketId, attachmentId) {
-  return db
-    .prepare("SELECT * FROM attachments WHERE id = ? AND ticket_id = ?")
-    .get(attachmentId, ticketId);
+async function getAttachment(ticketId, attachmentId) {
+  return db.prepare("SELECT * FROM attachments WHERE id = ? AND ticket_id = ?").get(attachmentId, ticketId);
 }
 
 // For the public (/status) download route: the visibility filter is
 // enforced here too, not just on the listing - otherwise a requester who
 // guesses/enumerates an attachment id could fetch an internal-only file
 // directly even though it's never listed for them.
-function getPublicAttachment(ticketId, attachmentId) {
-  return db
-    .prepare("SELECT * FROM attachments WHERE id = ? AND ticket_id = ? AND visible_to_requester = 1")
-    .get(attachmentId, ticketId);
+async function getPublicAttachment(ticketId, attachmentId) {
+  return db.prepare("SELECT * FROM attachments WHERE id = ? AND ticket_id = ? AND visible_to_requester = 1").get(attachmentId, ticketId);
 }
 
 function formatSize(bytes) {

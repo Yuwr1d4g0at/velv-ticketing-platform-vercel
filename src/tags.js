@@ -1,3 +1,13 @@
+// Ported to the async Postgres adapter (see src/db/index.js). Two SQLite-
+// specific idioms needed translating, not just async/await:
+// - `INSERT OR IGNORE` -> `ON CONFLICT ... DO NOTHING`. tags' own conflict
+//   target is the functional unique index on LOWER(name) (see scripts/
+//   migrate.js's idx_tags_name_lower - Postgres has no COLLATE NOCASE
+//   without an extension), so the ON CONFLICT clause has to name that exact
+//   expression, `((LOWER(name)))`, for Postgres to recognize it as the same
+//   constraint. ticket_tags' conflict target is just its own composite
+//   primary key (ticket_id, tag_id).
+// - `WHERE name = ? COLLATE NOCASE` -> `WHERE LOWER(name) = LOWER(?)`.
 const db = require("./db");
 
 const MAX_TAG_LENGTH = 30;
@@ -7,25 +17,25 @@ function normalizeTagName(raw) {
 }
 
 // Reuses an existing tag regardless of case ("Billing" and "billing" are the
-// same tag - see the UNIQUE COLLATE NOCASE constraint in src/db/index.js),
-// creating a new one only if no case-insensitive match exists yet.
-function addTagToTicket(ticketId, rawName) {
+// same tag - see idx_tags_name_lower in scripts/migrate.js), creating a new
+// one only if no case-insensitive match exists yet.
+async function addTagToTicket(ticketId, rawName) {
   const name = normalizeTagName(rawName);
   if (!name) return null;
 
-  db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)").run(name);
-  const tag = db.prepare("SELECT id, name FROM tags WHERE name = ? COLLATE NOCASE").get(name);
-  db.prepare("INSERT OR IGNORE INTO ticket_tags (ticket_id, tag_id) VALUES (?, ?)").run(ticketId, tag.id);
+  await db.prepare("INSERT INTO tags (name) VALUES (?) ON CONFLICT ((LOWER(name))) DO NOTHING").run(name);
+  const tag = await db.prepare("SELECT id, name FROM tags WHERE LOWER(name) = LOWER(?)").get(name);
+  await db.prepare("INSERT INTO ticket_tags (ticket_id, tag_id) VALUES (?, ?) ON CONFLICT (ticket_id, tag_id) DO NOTHING").run(ticketId, tag.id);
   return tag;
 }
 
 // Only unlinks the tag from this ticket - the tag itself stays in the
 // catalog (for reuse / the filter dropdown) even if now unused everywhere.
-function removeTagFromTicket(ticketId, tagId) {
-  db.prepare("DELETE FROM ticket_tags WHERE ticket_id = ? AND tag_id = ?").run(ticketId, tagId);
+async function removeTagFromTicket(ticketId, tagId) {
+  await db.prepare("DELETE FROM ticket_tags WHERE ticket_id = ? AND tag_id = ?").run(ticketId, tagId);
 }
 
-function tagsForTicket(ticketId) {
+async function tagsForTicket(ticketId) {
   return db
     .prepare(
       `SELECT tags.id, tags.name FROM ticket_tags
@@ -36,7 +46,7 @@ function tagsForTicket(ticketId) {
     .all(ticketId);
 }
 
-function allTags() {
+async function allTags() {
   return db.prepare("SELECT id, name FROM tags ORDER BY name").all();
 }
 

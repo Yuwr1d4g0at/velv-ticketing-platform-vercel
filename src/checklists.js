@@ -29,33 +29,37 @@
 // pre-existing Link behavior, unchanged by this file - flagged here (and
 // in this feature's PR description) rather than fixed, since fixing Link's
 // own display is out of scope for this feature.
+//
+// Ported to the async Postgres adapter (see src/db/index.js). `INSERT OR
+// IGNORE INTO ticket_links` -> `ON CONFLICT (ticket_id, linked_ticket_id)
+// DO NOTHING` (that table's own composite primary key).
 const db = require("./db");
 const departments = require("./departments");
 const { triggerWebhooks } = require("./webhooks");
 
-function itemsForTemplate(templateId) {
+async function itemsForTemplate(templateId) {
   return db.prepare("SELECT * FROM template_checklist_items WHERE template_id = ? ORDER BY position, id").all(templateId);
 }
 
-function addChecklistItem(templateId, { label, spawnCategory }) {
+async function addChecklistItem(templateId, { label, spawnCategory }) {
   const trimmedLabel = (label || "").trim().slice(0, 200);
   if (!trimmedLabel) return { error: "A checklist item needs a label." };
   const category = (spawnCategory || "").trim();
-  if (category && !departments.isValidCategoryName(category)) {
+  if (category && !(await departments.isValidCategoryName(category))) {
     return { error: "Choose a valid category to spawn a ticket in, or leave it blank for a plain checklist line." };
   }
 
-  const position = db
-    .prepare("SELECT COALESCE(MAX(position), -1) + 1 AS next FROM template_checklist_items WHERE template_id = ?")
-    .get(templateId).next;
-  const result = db
+  const position = (
+    await db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS next FROM template_checklist_items WHERE template_id = ?").get(templateId)
+  ).next;
+  const result = await db
     .prepare("INSERT INTO template_checklist_items (template_id, label, spawn_category, position) VALUES (?, ?, ?, ?)")
     .run(templateId, trimmedLabel, category || null, position);
   return { id: result.lastInsertRowid };
 }
 
-function removeChecklistItem(id) {
-  db.prepare("DELETE FROM template_checklist_items WHERE id = ?").run(id);
+async function removeChecklistItem(id) {
+  await db.prepare("DELETE FROM template_checklist_items WHERE id = ?").run(id);
 }
 
 function substituteName(text, name) {
@@ -66,39 +70,37 @@ function substituteName(text, name) {
 // origin ticket. originTicket needs {id, subject, requester_name,
 // requester_email}. Returns the spawned ticket ids (empty array if this
 // template has no spawn-flagged items).
-function applyTemplateSpawns({ templateId, originTicket, agentId }) {
-  const items = itemsForTemplate(templateId).filter((i) => i.spawn_category);
+async function applyTemplateSpawns({ templateId, originTicket, agentId }) {
+  const items = (await itemsForTemplate(templateId)).filter((i) => i.spawn_category);
   if (!items.length) return [];
 
   const insertTicket = db.prepare(
     `INSERT INTO tickets (subject, description, category, requester_name, requester_email)
      VALUES (?, ?, ?, ?, ?)`
   );
-  const insertActivity = db.prepare(
-    `INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`
-  );
+  const insertActivity = db.prepare(`INSERT INTO ticket_activity (ticket_id, agent_id, type, body) VALUES (?, ?, 'note', ?)`);
   // Symmetric insert - same shape as the /tickets/:id/link route, so either
   // ticket's own page finds the link with a plain "WHERE ticket_id = ?".
-  const insertLink = db.prepare("INSERT OR IGNORE INTO ticket_links (ticket_id, linked_ticket_id) VALUES (?, ?)");
+  const insertLink = db.prepare("INSERT INTO ticket_links (ticket_id, linked_ticket_id) VALUES (?, ?) ON CONFLICT (ticket_id, linked_ticket_id) DO NOTHING");
 
   const spawnedIds = [];
   for (const item of items) {
     const subject = substituteName(item.label, originTicket.requester_name).slice(0, 200);
     const description = `Spawned from ticket #${originTicket.id} ("${originTicket.subject}") via its onboarding checklist.`;
 
-    const result = insertTicket.run(subject, description, item.spawn_category, originTicket.requester_name, originTicket.requester_email);
+    const result = await insertTicket.run(subject, description, item.spawn_category, originTicket.requester_name, originTicket.requester_email);
     const spawnedId = result.lastInsertRowid;
 
-    insertActivity.run(spawnedId, agentId, `Created from ticket #${originTicket.id}'s onboarding checklist.`);
-    insertActivity.run(originTicket.id, agentId, `Spawned ticket #${spawnedId} ("${subject}") from the onboarding checklist.`);
+    await insertActivity.run(spawnedId, agentId, `Created from ticket #${originTicket.id}'s onboarding checklist.`);
+    await insertActivity.run(originTicket.id, agentId, `Spawned ticket #${spawnedId} ("${subject}") from the onboarding checklist.`);
 
-    insertLink.run(originTicket.id, spawnedId);
-    insertLink.run(spawnedId, originTicket.id);
+    await insertLink.run(originTicket.id, spawnedId);
+    await insertLink.run(spawnedId, originTicket.id);
 
-    triggerWebhooks(
+    await triggerWebhooks(
       "ticket.created",
       { ticket_id: spawnedId, subject, category: item.spawn_category, requester_email: originTicket.requester_email },
-      departments.departmentIdForCategory(item.spawn_category)
+      await departments.departmentIdForCategory(item.spawn_category)
     );
 
     spawnedIds.push(spawnedId);

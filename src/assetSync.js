@@ -75,7 +75,7 @@ async function resolveFieldMap(siteId, listId) {
 async function runSync() {
   if (!msGraph.isEnabled()) return { skipped: "Microsoft Graph is not configured." };
 
-  const runId = db.prepare("INSERT INTO asset_sync_runs (started_at) VALUES (datetime('now'))").run().lastInsertRowid;
+  const runId = (await db.prepare("INSERT INTO asset_sync_runs (started_at) VALUES (now_text())").run()).lastInsertRowid;
 
   try {
     const siteId = await msGraph.resolveSiteId(SITE_HOSTNAME, SITE_PATH);
@@ -137,19 +137,19 @@ async function runSync() {
         notes: noteParts.join("\n"),
       };
 
-      const existing = db.prepare("SELECT * FROM assets WHERE asset_tag = ?").get(assetTag);
+      const existing = await db.prepare("SELECT * FROM assets WHERE asset_tag = ?").get(assetTag);
       let result;
       if (existing) {
         // location/warranty_expires have no SharePoint source - carried
         // over from the asset's own current value so this update can't
         // silently null them out.
-        result = assets.update(
+        result = await assets.update(
           existing.id,
           { ...sourcedFields, location: existing.location, warranty_expires: existing.warranty_expires },
           null
         );
       } else {
-        result = assets.create(sourcedFields, null);
+        result = await assets.create(sourcedFields, null);
       }
 
       if (result.error) {
@@ -161,13 +161,13 @@ async function runSync() {
       }
     }
 
-    db.prepare(
-      `UPDATE asset_sync_runs SET finished_at = datetime('now'), created_count = ?, updated_count = ?, failed_count = ? WHERE id = ?`
-    ).run(stats.created, stats.updated, stats.failed.length, runId);
+    await db
+      .prepare(`UPDATE asset_sync_runs SET finished_at = now_text(), created_count = ?, updated_count = ?, failed_count = ? WHERE id = ?`)
+      .run(stats.created, stats.updated, stats.failed.length, runId);
 
     return stats;
   } catch (err) {
-    db.prepare(`UPDATE asset_sync_runs SET finished_at = datetime('now'), error = ? WHERE id = ?`).run(err.message, runId);
+    await db.prepare(`UPDATE asset_sync_runs SET finished_at = now_text(), error = ? WHERE id = ?`).run(err.message, runId);
     throw err;
   }
 }
@@ -176,14 +176,14 @@ async function runSync() {
 // more than intervalHours have passed since the last run STARTED (whether
 // it succeeded or not, so a broken sync doesn't retry every few minutes
 // forever and hammer Graph while something's wrong upstream).
-function isDue(intervalHours) {
-  const last = db.prepare("SELECT started_at FROM asset_sync_runs ORDER BY id DESC LIMIT 1").get();
+async function isDue(intervalHours) {
+  const last = await db.prepare("SELECT started_at FROM asset_sync_runs ORDER BY id DESC LIMIT 1").get();
   if (!last) return true;
   const ageMs = Date.now() - new Date(`${last.started_at.replace(" ", "T")}Z`).getTime();
   return ageMs > intervalHours * 60 * 60 * 1000;
 }
 
-function recentRuns(limit = 20) {
+async function recentRuns(limit = 20) {
   return db.prepare("SELECT * FROM asset_sync_runs ORDER BY id DESC LIMIT ?").all(limit);
 }
 

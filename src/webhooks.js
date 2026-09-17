@@ -24,22 +24,25 @@ function sign(secret, body) {
 // and every webhook that existed before this feature) still fires
 // platform-wide, unchanged. Passing no departmentId (e.g. an event with no
 // natural single department) never filters anything out.
-function triggerWebhooks(eventType, payload, departmentId = null) {
-  const subscribed = db
-    .prepare("SELECT * FROM webhooks WHERE active = 1")
-    .all()
-    .filter((w) => w.events.split(",").includes(eventType))
-    .filter((w) => w.department_id == null || departmentId == null || w.department_id === departmentId);
-  if (!subscribed.length) return;
+async function triggerWebhooks(eventType, payload, departmentId = null) {
+  try {
+    const webhooks = await db.prepare("SELECT * FROM webhooks WHERE active = 1").all();
+    const subscribed = webhooks
+      .filter((w) => w.events.split(",").includes(eventType))
+      .filter((w) => w.department_id == null || departmentId == null || w.department_id === departmentId);
+    if (!subscribed.length) return;
 
-  const body = JSON.stringify({ event: eventType, sent_at: new Date().toISOString(), data: payload });
+    const body = JSON.stringify({ event: eventType, sent_at: new Date().toISOString(), data: payload });
 
-  for (const webhook of subscribed) {
-    fetch(webhook.url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Velv-Signature": sign(webhook.secret, body) },
-      body,
-    }).catch((err) => console.error(`Webhook delivery to ${webhook.url} failed:`, err.message));
+    for (const webhook of subscribed) {
+      fetch(webhook.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Velv-Signature": sign(webhook.secret, body) },
+        body,
+      }).catch((err) => console.error(`Webhook delivery to ${webhook.url} failed:`, err.message));
+    }
+  } catch (err) {
+    console.error("Could not look up subscribed webhooks:", err.message);
   }
 }
 

@@ -39,18 +39,14 @@ async function main() {
   }
 
   const normalizedEmail = email.toLowerCase();
-  const existing = db.prepare("SELECT id FROM agents WHERE email = ?").get(normalizedEmail);
+  const existing = await db.prepare("SELECT id FROM agents WHERE email = ?").get(normalizedEmail);
   if (existing) {
     console.error(`\nAn agent with the email ${normalizedEmail} already exists.`);
     process.exit(1);
   }
 
   const passwordHash = bcrypt.hashSync(password, 12);
-  db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(
-    name,
-    normalizedEmail,
-    passwordHash
-  );
+  await db.prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)").run(name, normalizedEmail, passwordHash);
 
   console.log(`\nAgent "${name}" <${normalizedEmail}> created. You can now log in at /login.`);
   process.exit(0);
