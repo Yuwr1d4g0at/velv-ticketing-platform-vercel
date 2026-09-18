@@ -1,0 +1,162 @@
+<%- include('../partials/header') %>
+<div class="dashboard-head">
+  <div class="dashboard-head-title">
+    <h1>Consultants</h1>
+  </div>
+  <p class="muted">External consultants HR and Legal engage - outside counsel, recruiters, expert witnesses, trainers, and the like. A persistent record with its own lifecycle, separate from tickets.</p>
+  <div class="stat-row">
+    <% statuses.forEach(function(s) { %>
+      <div class="stat-tile stat-tile-<%= s.replace(/\s+/g, '-').toLowerCase() %>">
+        <span class="stat-count"><%= statusCounts[s] || 0 %></span>
+        <span class="stat-label"><%= s %></span>
+      </div>
+    <% }) %>
+  </div>
+</div>
+
+<form action="/dashboard/consultants" method="GET" class="filter-bar">
+  <input type="text" name="q" placeholder="Search name or company&hellip;" value="<%= filters.q %>">
+
+  <select name="status">
+    <option value="">All statuses</option>
+    <% statuses.forEach(function(s) { %>
+      <option value="<%= s %>" <%= filters.status === s ? 'selected' : '' %>><%= s %></option>
+    <% }) %>
+  </select>
+
+  <% if (departmentsList) { %>
+    <select name="department_id">
+      <option value="">All departments</option>
+      <% departmentsList.forEach(function(d) { %>
+        <option value="<%= d.id %>" <%= String(filters.department_id) === String(d.id) ? 'selected' : '' %>><%= d.name %></option>
+      <% }) %>
+    </select>
+  <% } %>
+
+  <button type="submit" class="button-secondary">Filter</button>
+  <a href="/dashboard/consultants" class="button-secondary button-ghost">Reset</a>
+  <a href="/dashboard/consultants/export.csv?<%= exportQuery %>" class="button-secondary button-ghost">
+    <span class="icon icon-download"></span> Export CSV
+  </a>
+</form>
+
+<% if (!items.length) { %>
+  <p class="empty-row card">No consultants match these filters.</p>
+<% } else { %>
+  <div class="asset-grid">
+    <% items.forEach(function(c) { %>
+      <a class="asset-card" href="/dashboard/consultants/<%= c.id %>">
+        <div class="asset-card-top">
+          <span class="asset-card-category"><%= c.department_name %></span>
+          <span class="badge badge-consultant-status-<%= c.status.replace(/\s+/g, '-').toLowerCase() %>"><%= c.status %></span>
+        </div>
+        <p class="asset-card-name"><%= c.name %><% if (c.confidential) { %> <span class="badge badge-aging">Confidential</span><% } %></p>
+        <p class="asset-card-tag"><% if (c.company) { %><%= c.company %><% } else { %>Freelance<% } %><% if (c.specialty) { %> &middot; <%= c.specialty %><% } %></p>
+        <div class="asset-card-meta">
+          <span><% if (c.assigned_to_name) { %><%= c.assigned_to_name %><% } else { %>Unassigned<% } %></span>
+        </div>
+      </a>
+    <% }) %>
+  </div>
+<% } %>
+
+<% if (totalPages > 1) { %>
+  <nav class="pagination">
+    <% if (page > 1) { %>
+      <a class="button-secondary" href="/dashboard/consultants?<%= exportQuery %>&page=<%= page - 1 %>">&larr; Previous</a>
+    <% } else { %>
+      <span class="button-secondary" aria-disabled="true">&larr; Previous</span>
+    <% } %>
+    <span class="pagination-status">Page <%= page %> of <%= totalPages %> &middot; <%= totalCount %> consultant<%= totalCount === 1 ? '' : 's' %></span>
+    <% if (page < totalPages) { %>
+      <a class="button-secondary" href="/dashboard/consultants?<%= exportQuery %>&page=<%= page + 1 %>">Next &rarr;</a>
+    <% } else { %>
+      <span class="button-secondary" aria-disabled="true">Next &rarr;</span>
+    <% } %>
+  </nav>
+<% } %>
+
+<button
+  type="button"
+  class="button-secondary"
+  data-toggle="add-consultant-panel"
+  data-label-show="+ Add consultant"
+  data-label-hide="&minus; Add consultant"
+><% if (error) { %>&minus; Add consultant<% } else { %>+ Add consultant<% } %></button>
+
+<div class="card card-medium" id="add-consultant-panel" <%= error ? '' : 'hidden' %>>
+  <h2>Add a consultant</h2>
+  <% if (error) { %>
+    <div class="alert alert-error" role="alert"><span class="icon icon-alert-triangle"></span><%= error %></div>
+  <% } %>
+  <form action="/dashboard/consultants" method="POST" class="stacked-form">
+    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+
+    <label for="name">Name</label>
+    <input type="text" id="name" name="name" required maxlength="200" value="<%= values.name || '' %>" placeholder="Jane Doe">
+
+    <div class="form-row">
+      <div>
+        <label for="company">Company</label>
+        <input type="text" id="company" name="company" maxlength="200" value="<%= values.company || '' %>" placeholder="Leave blank if freelance">
+      </div>
+      <div>
+        <label for="specialty">Specialty</label>
+        <input type="text" id="specialty" name="specialty" maxlength="200" value="<%= values.specialty || '' %>" placeholder="Employment Lawyer, Recruiter, Trainer&hellip;">
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div>
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" maxlength="200" value="<%= values.email || '' %>">
+      </div>
+      <div>
+        <label for="phone">Phone</label>
+        <input type="text" id="phone" name="phone" maxlength="200" value="<%= values.phone || '' %>">
+      </div>
+    </div>
+
+    <% if (departmentsList) { %>
+      <label for="department_id">Department</label>
+      <select id="department_id" name="department_id" required>
+        <% departmentsList.forEach(function(d) { %>
+          <option value="<%= d.id %>" <%= String(values.department_id) === String(d.id) ? 'selected' : '' %>><%= d.name %></option>
+        <% }) %>
+      </select>
+    <% } %>
+
+    <div class="form-row">
+      <div>
+        <label for="engagement_start">Engagement start</label>
+        <input type="date" id="engagement_start" name="engagement_start" value="<%= values.engagement_start || '' %>">
+      </div>
+      <div>
+        <label for="engagement_end">Engagement end</label>
+        <input type="date" id="engagement_end" name="engagement_end" value="<%= values.engagement_end || '' %>">
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div>
+        <label for="rate">Rate</label>
+        <input type="text" id="rate" name="rate" maxlength="200" value="<%= values.rate || '' %>" placeholder="&euro;500/day, $150/hr&hellip;">
+      </div>
+      <div>
+        <label for="assigned_to">Assigned to</label>
+        <select id="assigned_to" name="assigned_to">
+          <option value="">Unassigned</option>
+          <% assignableAgents.forEach(function(a) { %>
+            <option value="<%= a.id %>" <%= String(values.assigned_to) === String(a.id) ? 'selected' : '' %>><%= a.name %></option>
+          <% }) %>
+        </select>
+      </div>
+    </div>
+
+    <label for="notes">Notes</label>
+    <textarea id="notes" name="notes" rows="3" maxlength="5000"><%= values.notes || '' %></textarea>
+
+    <button type="submit" class="button-primary">Add consultant</button>
+  </form>
+</div>
+<%- include('../partials/footer') %>

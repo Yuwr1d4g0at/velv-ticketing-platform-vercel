@@ -235,6 +235,44 @@ const SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_asset_activity_asset_id ON asset_activity(asset_id);
 
+  -- External consultants HR/Legal engage (outside counsel, recruiters, expert
+  -- witnesses, trainers, ...) - a persistent record with its own lifecycle,
+  -- not a ticket. Modeled closely on assets/asset_activity above (retire via
+  -- status rather than DELETE, field-level change history) - see
+  -- src/consultants.js. department_id/confidential follow the exact same
+  -- strict department-visibility + confidential-narrows-further model as
+  -- tickets (see src/departments.js's canSeeConsultant/
+  -- consultantVisibilitySql) - deliberately no assignment/watcher carve-out.
+  CREATE TABLE IF NOT EXISTS consultants (
+    id                 SERIAL PRIMARY KEY,
+    name               TEXT NOT NULL,
+    company            TEXT,
+    specialty          TEXT,
+    email              TEXT,
+    phone              TEXT,
+    department_id      INTEGER NOT NULL REFERENCES departments(id),
+    status             TEXT NOT NULL DEFAULT 'Active',
+    engagement_start   TEXT,
+    engagement_end     TEXT,
+    rate               TEXT,
+    assigned_to        INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+    confidential       INTEGER NOT NULL DEFAULT 0,
+    notes              TEXT,
+    created_at         TEXT NOT NULL DEFAULT ${NOW_TEXT},
+    updated_at         TEXT NOT NULL DEFAULT ${NOW_TEXT}
+  );
+  CREATE INDEX IF NOT EXISTS idx_consultants_department_id ON consultants(department_id);
+  CREATE INDEX IF NOT EXISTS idx_consultants_status ON consultants(status);
+
+  CREATE TABLE IF NOT EXISTS consultant_activity (
+    id            SERIAL PRIMARY KEY,
+    consultant_id INTEGER NOT NULL REFERENCES consultants(id) ON DELETE CASCADE,
+    agent_id      INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+    body          TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT ${NOW_TEXT}
+  );
+  CREATE INDEX IF NOT EXISTS idx_consultant_activity_consultant_id ON consultant_activity(consultant_id);
+
   CREATE TABLE IF NOT EXISTS saved_views (
     id           SERIAL PRIMARY KEY,
     agent_id     INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
