@@ -2,6 +2,21 @@
 // port - src/server.js does that. Split out so tests can require this
 // directly and drive it with an in-process HTTP server on an ephemeral port,
 // without going through the real startup script.
+
+// src/aging.js's business-hours window and src/digest.js's DIGEST_HOUR both
+// document themselves as running in "the server process's own local
+// timezone" - true for a traditional always-on server, but a Vercel
+// Function has no timezone of its own and defaults to UTC, silently
+// turning "local time" into UTC and shifting the real Lisbon business-hours
+// window (and the daily digest's send time) by an hour across every DST
+// transition. Set once, as early as possible (before any Date math in any
+// required module below runs), so every local-time Date method
+// (getHours/getDay/getDate/...) actually reflects Lisbon time - grep
+// confirms this is the only local-timezone-dependent code in the app, so
+// this fixes both call sites without changing anything else's behavior.
+// Overridable via TZ in .env for a deployment outside Portugal.
+process.env.TZ = process.env.TZ || "Europe/Lisbon";
+
 const path = require("path");
 const express = require("express");
 const session = require("express-session");
@@ -94,7 +109,12 @@ app.get("/healthz", async (req, res) => {
     await db.prepare("SELECT 1").get();
     res.status(200).json({ status: "ok" });
   } catch (err) {
-    res.status(503).json({ status: "error", message: err.message });
+    // Logged server-side, not returned - this endpoint is unauthenticated
+    // by design (a host/uptime monitor has no session), so the raw DB error
+    // text (connection details, internal hostnames) has no business going
+    // to whoever's polling it.
+    console.error("Health check failed:", err.message);
+    res.status(503).json({ status: "error" });
   }
 });
 

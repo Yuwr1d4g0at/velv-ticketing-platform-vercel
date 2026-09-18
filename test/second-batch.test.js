@@ -3,20 +3,31 @@ const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
-let app, client, db;
+let app, client, adminClient, db;
 
 before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
+  adminClient = makeClient(app.baseUrl);
   db = app.db;
 
   await db
     .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
     .run("Batch Two Agent", "batch-two@example.com", bcrypt.hashSync("correct-password", 4));
+  // Webhook config is admin-only (see src/routes/dashboard.js) - a
+  // dedicated admin, kept separate from the regular Batch Two Agent used
+  // everywhere else in this file.
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)")
+    .run("Batch Two Admin", "batch-two-admin@example.com", bcrypt.hashSync("correct-password", 4));
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
   await client.postForm("/login", { email: "batch-two@example.com", password: "correct-password", _csrf: csrf });
+
+  const adminLoginPage = await adminClient.get("/login");
+  const adminCsrf = extractCsrf(await adminLoginPage.text());
+  await adminClient.postForm("/login", { email: "batch-two-admin@example.com", password: "correct-password", _csrf: adminCsrf });
 });
 
 after(() => app.close());
@@ -111,9 +122,14 @@ test("webhooks: create, receive a signed POST on ticket creation, pause, and del
   await new Promise((resolve) => receiver.listen(0, resolve));
   const receiverUrl = `http://127.0.0.1:${receiver.address().port}/hook`;
 
-  const page = await client.get("/dashboard/settings/webhooks");
+  // Admin-only (see src/routes/dashboard.js) - webhooks reach across every
+  // department, unlike tickets/consultants, so this uses adminClient
+  // rather than the regular Batch Two Agent client used everywhere else in
+  // this file. The receiver above is on 127.0.0.1, which src/urlSafety.js
+  // only allows under NODE_ENV=test - see that file's header comment.
+  const page = await adminClient.get("/dashboard/settings/webhooks");
   const csrf = extractCsrf(await page.text());
-  await client.postForm("/dashboard/settings/webhooks", { url: receiverUrl, events: "ticket.created", _csrf: csrf });
+  await adminClient.postForm("/dashboard/settings/webhooks", { url: receiverUrl, events: "ticket.created", _csrf: csrf });
 
   await submitTicket({ subject: "Triggers a webhook" });
   await new Promise((resolve) => setTimeout(resolve, 200)); // fire-and-forget delivery
@@ -124,18 +140,58 @@ test("webhooks: create, receive a signed POST on ticket creation, pause, and del
   assert.equal(payload.event, "ticket.created");
   assert.equal(payload.data.subject, "Triggers a webhook");
 
-  const listHtml = await (await client.get("/dashboard/settings/webhooks")).text();
+  const listHtml = await (await adminClient.get("/dashboard/settings/webhooks")).text();
   const webhookId = listHtml.match(/webhooks\/(\d+)\/toggle/)[1];
-  await client.postForm(`/dashboard/settings/webhooks/${webhookId}/toggle`, { _csrf: csrf });
+  await adminClient.postForm(`/dashboard/settings/webhooks/${webhookId}/toggle`, { _csrf: csrf });
   await submitTicket({ subject: "Should not trigger, webhook paused" });
   await new Promise((resolve) => setTimeout(resolve, 200));
   assert.equal(received.length, 1); // no new delivery while paused
 
-  await client.postForm(`/dashboard/settings/webhooks/${webhookId}/delete`, { _csrf: csrf });
-  const afterDelete = await (await client.get("/dashboard/settings/webhooks")).text();
+  await adminClient.postForm(`/dashboard/settings/webhooks/${webhookId}/delete`, { _csrf: csrf });
+  const afterDelete = await (await adminClient.get("/dashboard/settings/webhooks")).text();
   assert.doesNotMatch(afterDelete, new RegExp(receiverUrl.replace(/\//g, "\\/")));
 
   await new Promise((resolve) => receiver.close(resolve));
+});
+
+test("webhook settings are admin-only - a regular agent is blocked from viewing or creating one", async () => {
+  const getRes = await client.get("/dashboard/settings/webhooks");
+  assert.equal(getRes.status, 403);
+
+  // CSRF would 403 first for a forged token, so borrow a real one off a
+  // page this agent CAN load, same trick used elsewhere in this suite for
+  // "does the permission check run before anything else" tests.
+  const anyPage = await client.get("/dashboard");
+  const csrf = extractCsrf(await anyPage.text());
+  const postRes = await client.postForm("/dashboard/settings/webhooks", {
+    url: "https://example.com/hook",
+    events: "ticket.created",
+    _csrf: csrf,
+  });
+  assert.equal(postRes.status, 403);
+
+  const count = (await db.prepare("SELECT COUNT(*) c FROM webhooks WHERE url = 'https://example.com/hook'").get()).c;
+  assert.equal(count, 0, "the forged create attempt must not have gone through");
+});
+
+test("a webhook URL that resolves to a private/internal address is rejected", async () => {
+  const page = await adminClient.get("/dashboard/settings/webhooks");
+  const csrf = extractCsrf(await page.text());
+
+  // 10.x is blocked even under NODE_ENV=test - only 127.0.0.1 gets the
+  // test-only loopback exception (see src/urlSafety.js and the delivery
+  // test above, which relies on that exception to work at all).
+  const res = await adminClient.postForm("/dashboard/settings/webhooks", {
+    url: "http://10.0.0.5/internal-hook",
+    events: "ticket.created",
+    _csrf: csrf,
+  });
+  assert.equal(res.status, 400);
+  const html = await res.text();
+  assert.match(html, /private or internal address/);
+
+  const count = (await db.prepare("SELECT COUNT(*) c FROM webhooks WHERE url = 'http://10.0.0.5/internal-hook'").get()).c;
+  assert.equal(count, 0);
 });
 
 test("agent-initiated ticket creation sets priority and assignment immediately, no round-robin", async () => {

@@ -4,6 +4,7 @@
 // receiving end must never hold up or fail the request that triggered it.
 const crypto = require("crypto");
 const db = require("./db");
+const { isUrlSafeForWebhook } = require("./urlSafety");
 
 const WEBHOOK_EVENTS = ["ticket.created", "ticket.status_changed", "ticket.assigned"];
 
@@ -35,11 +36,25 @@ async function triggerWebhooks(eventType, payload, departmentId = null) {
     const body = JSON.stringify({ event: eventType, sent_at: new Date().toISOString(), data: payload });
 
     for (const webhook of subscribed) {
-      fetch(webhook.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Velv-Signature": sign(webhook.secret, body) },
-        body,
-      }).catch((err) => console.error(`Webhook delivery to ${webhook.url} failed:`, err.message));
+      // Re-checked here, not just at save time (see src/urlSafety.js) - a
+      // hostname that resolved to a public address when the webhook was
+      // created could be repointed at an internal one by the time it
+      // actually fires. Still fire-and-forget overall - this just gates
+      // each individual fetch behind its own safety check, without making
+      // the loop itself wait webhook-by-webhook.
+      isUrlSafeForWebhook(webhook.url)
+        .then((safe) => {
+          if (!safe) {
+            console.error(`Webhook delivery to ${webhook.url} blocked - resolves to a private/internal address.`);
+            return;
+          }
+          return fetch(webhook.url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Velv-Signature": sign(webhook.secret, body) },
+            body,
+          }).catch((err) => console.error(`Webhook delivery to ${webhook.url} failed:`, err.message));
+        })
+        .catch((err) => console.error(`Webhook safety check for ${webhook.url} failed:`, err.message));
     }
   } catch (err) {
     console.error("Could not look up subscribed webhooks:", err.message);

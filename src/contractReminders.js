@@ -17,6 +17,14 @@
 // only that ticket's own department's active agents - one digest per
 // department per run, never handing a Legal ticket's subject to an IT/HR/
 // Marketing inbox just because their agents are also "active".
+//
+// Confidential tickets are excluded outright (confidential = 0 in the query
+// below), not just narrowed - this digest goes to the whole department, not
+// just the ticket's assignee, and departments.canSeeTicket()'s confidential
+// rule restricts a confidential ticket to admins and its own assignee. The
+// assignee still sees the approaching reminder date via the ticket's own
+// (correctly-scoped) detail page; they just don't get it pushed to every
+// department inbox by email.
 const db = require("./db");
 const departments = require("./departments");
 const { sendContractReminderDigest } = require("./mailer");
@@ -32,6 +40,7 @@ async function checkContractReminders() {
          AND reminder_alerted_at IS NULL
          AND status NOT IN ('Resolved', 'Closed')
          AND merged_into_id IS NULL
+         AND confidential = 0
          AND reminder_date::date <= (CURRENT_DATE + (?::integer * INTERVAL '1 day'))::date`
     )
     .all(CONTRACT_REMINDER_ALERT_DAYS);

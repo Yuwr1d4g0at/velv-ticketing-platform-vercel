@@ -23,6 +23,7 @@ const canned = require("../canned-responses");
 const assets = require("../assets");
 const { exportRequesterData, eraseRequesterData } = require("../privacy");
 const { WEBHOOK_EVENTS, generateSecret, triggerWebhooks } = require("../webhooks");
+const { isUrlSafeForWebhook } = require("../urlSafety");
 const { WARRANTY_ALERT_DAYS } = require("../warranty");
 const kb = require("../kb");
 const recurring = require("../recurring");
@@ -99,6 +100,22 @@ async function getTicketOr404(req, res, id) {
   }
   return ticket;
 }
+
+// Optimistic-locking check for the two ticket routes narrow enough to be
+// worth it (status, assignment - see applyStatusChange/applyAssignment
+// below): every property form embeds the ticket's updated_at as of when
+// the page was loaded (see views/dashboard/ticket.ejs's
+// expected_updated_at hidden field); getTicketOr404 above always reads the
+// CURRENT row fresh, so comparing the two catches a second agent's change
+// landing in between, instead of silently overwriting it last-write-wins.
+// A request with no expected_updated_at (a bulk action, an older client, a
+// direct API-style POST) is never treated as stale - this only guards the
+// two forms that actually send it.
+function isStale(record, expectedUpdatedAt) {
+  return Boolean(expectedUpdatedAt) && expectedUpdatedAt !== record.updated_at;
+}
+
+const STALE_RECORD_MESSAGE = "Someone else updated this since you loaded the page. Reload and try again.";
 
 // The categories a given agent is allowed to work with - every one of them
 // for an admin, only their own department's for anyone else. Backs the
@@ -1294,6 +1311,10 @@ router.post("/tickets/:id/status", verifyCsrf, async (req, res, next) => {
     const ticket = await getTicketOr404(req, res, req.params.id);
     if (!ticket) return;
 
+    if (isStale(ticket, req.body.expected_updated_at)) {
+      return res.status(409).render("error", { title: "This ticket changed", message: STALE_RECORD_MESSAGE });
+    }
+
     if (!STATUSES.includes(req.body.status)) {
       return res.status(400).render("error", { title: "Invalid status", message: "That status is not valid." });
     }
@@ -1550,6 +1571,10 @@ router.post("/tickets/:id/assign", verifyCsrf, async (req, res, next) => {
   try {
     const ticket = await getTicketOr404(req, res, req.params.id);
     if (!ticket) return;
+
+    if (isStale(ticket, req.body.expected_updated_at)) {
+      return res.status(409).render("error", { title: "This ticket changed", message: STALE_RECORD_MESSAGE });
+    }
 
     const raw = req.body.assigned_to;
     const newAssigneeId = raw ? parseInt(raw, 10) : null;
@@ -2862,6 +2887,13 @@ async function webhooksForDashboard() {
     .all();
 }
 
+// Admin-only, same reasoning as /agents below: webhooksForDashboard() has
+// no department filter (a webhook can be platform-wide - department_id
+// NULL - so "just scope it like tickets" doesn't fit cleanly), and every
+// webhook's URL and HMAC secret would otherwise be visible to, and
+// creatable/deletable by, any logged-in agent regardless of department.
+router.use("/settings/webhooks", requireAdmin);
+
 router.get("/settings/webhooks", async (req, res, next) => {
   try {
     res.render("dashboard/webhooks", {
@@ -2897,6 +2929,20 @@ router.post("/settings/webhooks", verifyCsrf, async (req, res, next) => {
         events: WEBHOOK_EVENTS,
         departmentsList: await departments.all(),
         error: "Enter a valid http(s) URL and choose at least one event.",
+      });
+    }
+
+    // SSRF guard (see src/urlSafety.js) - re-checked again at send time too,
+    // since DNS can change between now and when this webhook actually
+    // fires, but there's no reason to let an obviously internal address be
+    // saved in the first place.
+    if (!(await isUrlSafeForWebhook(url))) {
+      return res.status(400).render("dashboard/webhooks", {
+        title: "Webhooks",
+        webhooks: await webhooksForDashboard(),
+        events: WEBHOOK_EVENTS,
+        departmentsList: await departments.all(),
+        error: "That URL resolves to a private or internal address and can't be used for a webhook.",
       });
     }
 

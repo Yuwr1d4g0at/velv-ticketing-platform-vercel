@@ -41,10 +41,15 @@ router.get("/periodic-checks", async (req, res) => {
     await runPeriodicChecks();
     res.json({ ok: true });
   } catch (err) {
+    // The real message goes to the console, Sentry, and the admin alert
+    // email (alertAdmins above) - not the HTTP response. Same reasoning as
+    // /healthz: an unauthenticated-until-CRON_SECRET endpoint returning raw
+    // internal error text has no upside, even though the bar to reach it is
+    // already high.
     console.error("Cron periodic-checks run failed:", err.message);
     Sentry.captureException(err);
     await alertAdmins("periodic-checks", err);
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false });
   }
 });
 
@@ -64,7 +69,7 @@ router.get("/backup", async (req, res) => {
     console.error("Cron backup run failed:", err.message);
     Sentry.captureException(err);
     await alertAdmins("backup", err);
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false });
   }
 });
 

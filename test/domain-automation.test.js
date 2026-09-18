@@ -111,6 +111,26 @@ test("contract reminder check emails a ticket's own department once, and a date 
   assert.equal(ticket.reminder_alerted_at, null);
 });
 
+test("a confidential ticket's reminder never triggers the department-wide digest, even with an approaching date", async () => {
+  const { checkContractReminders } = require("../src/contractReminders");
+
+  const confidentialTicketId = (
+    await db
+      .prepare(
+        `INSERT INTO tickets (subject, description, category, requester_name, requester_email, confidential, reminder_date)
+         VALUES ('Confidential NDA matter', 'desc', 'NDA / Confidentiality', 'Req', 'req@example.com', 1, ?)
+         RETURNING id`
+      )
+      .get(isoDaysFromNow(5))
+  ).id;
+
+  const alertCount = await checkContractReminders();
+  assert.equal(alertCount, 0, "a confidential ticket must never be included in the department-wide digest count");
+
+  const ticket = await db.prepare("SELECT reminder_alerted_at FROM tickets WHERE id = ?").get(confidentialTicketId);
+  assert.equal(ticket.reminder_alerted_at, null, "never alerted means never marked alerted either - it stays eligible if it's ever made non-confidential");
+});
+
 test("contract reminder field is generic - not restricted to Legal categories at the DB/route level", async () => {
   const ticketPage = await itClient.get("/dashboard/tickets/new");
   const csrf = extractCsrf(await ticketPage.text());

@@ -201,6 +201,7 @@
 
         <form action="/dashboard/tickets/<%= ticket.id %>/status" method="POST" class="property-row">
           <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+          <input type="hidden" name="expected_updated_at" value="<%= ticket.updated_at %>">
           <label for="status">Status</label>
           <select id="status" name="status">
             <% statuses.forEach(function(s) { %>
@@ -212,6 +213,7 @@
 
         <form action="/dashboard/tickets/<%= ticket.id %>/assign" method="POST" class="property-row">
           <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+          <input type="hidden" name="expected_updated_at" value="<%= ticket.updated_at %>">
           <label for="assigned_to">Assigned</label>
           <select id="assigned_to" name="assigned_to">
             <option value="">Unassigned</option>
