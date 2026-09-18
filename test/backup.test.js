@@ -106,3 +106,43 @@ test("GET /api/cron/backup requires the CRON_SECRET bearer token", async () => {
   assert.equal(authorized.status, 200);
   assert.equal((await authorized.json()).ok, true);
 });
+
+test("a failed cron job alerts every active admin agent by email", async () => {
+  // SMTP is disabled in tests (see test/helpers.js), so mailer.send() itself
+  // is a no-op regardless - what's under test here is src/routes/cron.js's
+  // own alertAdmins() wiring: does it look up admins and call
+  // sendCronFailureAlert at all when a job throws. Both mailer.enabled and
+  // mailer.sendCronFailureAlert are read as properties on the required
+  // module object at call time (never destructured), so overwriting them
+  // here is visible to cron.js's own `require("../mailer")` - same cached
+  // module instance.
+  const mailer = require("../src/mailer");
+  const originalEnabled = mailer.enabled;
+  const originalSend = mailer.sendCronFailureAlert;
+  const sent = [];
+  mailer.enabled = true;
+  mailer.sendCronFailureAlert = async (args) => sent.push(args);
+
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)")
+    .run("Alert Admin", "alert-admin@example.com", "hash");
+
+  // Force a real failure inside runBackup() by pushing a nonexistent table
+  // onto backup.js's own TABLES array - exported by reference, not copied,
+  // so mutating it here reaches the same array runBackup() iterates.
+  backup.TABLES.push("does_not_exist_table");
+  let response;
+  try {
+    const client = makeClient(app.baseUrl);
+    response = await client.get("/api/cron/backup", {
+      headers: { authorization: `Bearer ${process.env.CRON_SECRET}` },
+    });
+  } finally {
+    backup.TABLES.pop();
+    mailer.enabled = originalEnabled;
+    mailer.sendCronFailureAlert = originalSend;
+  }
+
+  assert.equal(response.status, 500);
+  assert.ok(sent.some((s) => s.to === "alert-admin@example.com" && s.jobName === "backup"));
+});

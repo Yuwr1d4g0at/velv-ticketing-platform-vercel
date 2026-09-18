@@ -6,6 +6,17 @@ const path = require("path");
 const express = require("express");
 const session = require("express-session");
 const helmet = require("helmet");
+const Sentry = require("@sentry/node");
+
+// Optional error tracking - off entirely unless SENTRY_DSN is set, same
+// opt-in-via-env-var pattern as SMTP_HOST/MS_TENANT_ID elsewhere in this
+// app. Without it, an unhandled error only ever shows up in Vercel's own
+// function logs (see the final error-handling middleware below); with it,
+// exceptions from any route (and the cron routes' own try/catch blocks,
+// which capture explicitly) also reach Sentry's dashboard.
+if (process.env.SENTRY_DSN) {
+  Sentry.init({ dsn: process.env.SENTRY_DSN, tracesSampleRate: 0 });
+}
 
 const { attachAgent } = require("./middleware/auth");
 const { csrfToken } = require("./middleware/csrf");
@@ -124,6 +135,11 @@ app.use("/", publicRoutes);
 app.use((req, res) => {
   res.status(404).render("error", { title: "Not found", message: "That page does not exist." });
 });
+
+// A no-op if SENTRY_DSN isn't set (Sentry.init above was never called) -
+// must be registered after every route but before the app's own final
+// error handler below, per Sentry's own Express integration docs.
+if (process.env.SENTRY_DSN) Sentry.setupExpressErrorHandler(app);
 
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   console.error(err);

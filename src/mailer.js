@@ -192,6 +192,20 @@ function sendContractReminderDigest({ to, tickets }) {
   );
 }
 
+// A scheduled job (see src/routes/cron.js) threw instead of completing -
+// otherwise this would only ever surface in Vercel's own function logs,
+// which nobody's watching day to day. Goes to every active admin, not the
+// whole team, since this is an infra/ops concern, not something a regular
+// agent needs to act on.
+function sendCronFailureAlert({ to, jobName, error }) {
+  return send(
+    to,
+    `Cron job failed: ${jobName}`,
+    `The "${jobName}" scheduled job failed on its most recent run:\n\n${error}\n\n` +
+      `Check the function logs in the Vercel dashboard for the full stack trace.`
+  );
+}
+
 module.exports = {
   enabled,
   sendTicketCreatedEmail,
@@ -206,4 +220,5 @@ module.exports = {
   sendLowRatingEscalation,
   sendWarrantyExpiryDigest,
   sendContractReminderDigest,
+  sendCronFailureAlert,
 };
