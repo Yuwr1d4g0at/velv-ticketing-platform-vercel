@@ -42,6 +42,40 @@ test("login rejects the wrong password with a generic error", async () => {
   assert.match(html, /Incorrect email or password/);
 });
 
+test("login rejects an email that doesn't match any agent with the same generic error", async () => {
+  const loginPage = await client.get("/login");
+  const csrf = extractCsrf(await loginPage.text());
+
+  const res = await client.postForm("/login", { email: "no-such-agent@example.com", password: "wrong", _csrf: csrf });
+  const html = await res.text();
+  assert.equal(res.status, 401);
+  assert.match(html, /Incorrect email or password/);
+});
+
+test("login always runs a bcrypt compare, even for an email with no matching agent - no early-exit timing tell", async () => {
+  // src/routes/auth.js reads bcrypt.compareSync off this same required
+  // module object (never destructured), so spying on it here is visible to
+  // that file too - see its DUMMY_PASSWORD_HASH comment for why this
+  // matters: skipping the compare entirely for "no such user" would let a
+  // response-time difference reveal whether an email is a real agent.
+  const originalCompareSync = bcrypt.compareSync;
+  let callCount = 0;
+  bcrypt.compareSync = (...args) => {
+    callCount++;
+    return originalCompareSync(...args);
+  };
+
+  try {
+    const loginPage = await client.get("/login");
+    const csrf = extractCsrf(await loginPage.text());
+    await client.postForm("/login", { email: "still-no-such-agent@example.com", password: "wrong", _csrf: csrf });
+  } finally {
+    bcrypt.compareSync = originalCompareSync;
+  }
+
+  assert.equal(callCount, 1);
+});
+
 test("correct credentials log the agent in and unlock the dashboard", async () => {
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());

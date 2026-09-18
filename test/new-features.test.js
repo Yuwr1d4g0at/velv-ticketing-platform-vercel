@@ -3,20 +3,28 @@ const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
-let app, client, db;
+let app, client, adminClient, db;
 
 before(async () => {
   app = await startTestApp();
   client = makeClient(app.baseUrl);
+  adminClient = makeClient(app.baseUrl);
   db = app.db;
 
   await db
     .prepare("INSERT INTO agents (name, email, password_hash) VALUES (?, ?, ?)")
     .run("Feature Agent", "feature-agent@example.com", bcrypt.hashSync("correct-password", 4));
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)")
+    .run("Feature Admin", "feature-admin@example.com", bcrypt.hashSync("correct-password", 4));
 
   const loginPage = await client.get("/login");
   const csrf = extractCsrf(await loginPage.text());
   await client.postForm("/login", { email: "feature-agent@example.com", password: "correct-password", _csrf: csrf });
+
+  const adminLoginPage = await adminClient.get("/login");
+  const adminCsrf = extractCsrf(await adminLoginPage.text());
+  await adminClient.postForm("/login", { email: "feature-admin@example.com", password: "correct-password", _csrf: adminCsrf });
 });
 
 after(() => app.close());
@@ -262,7 +270,13 @@ test("GDPR export bundles a requester's tickets; erasure redacts identity, free 
   const csrf = extractCsrf(await ticketPage.text());
   await client.postForm(`/dashboard/tickets/${ticketId}/note`, { body: "Called the requester about this.", _csrf: csrf });
 
-  const exportRes = await client.get(`/dashboard/tickets/${ticketId}/privacy/export.json`);
+  // Admin-only (see src/routes/dashboard.js) - export/erase reach every
+  // department a requester has a ticket in, not just this one, so this uses
+  // adminClient rather than the regular Feature Agent client used above.
+  const adminTicketPage = await adminClient.get(`/dashboard/tickets/${ticketId}`);
+  const adminCsrf = extractCsrf(await adminTicketPage.text());
+
+  const exportRes = await adminClient.get(`/dashboard/tickets/${ticketId}/privacy/export.json`);
   assert.equal(exportRes.status, 200);
   const bundle = await exportRes.json();
   assert.equal(bundle.requester_email, "privacy-person@example.com");
@@ -276,7 +290,7 @@ test("GDPR export bundles a requester's tickets; erasure redacts identity, free 
   const beforeHead = await headBlob(attachmentRow.stored_name);
   assert.ok(beforeHead);
 
-  const eraseRes = await client.postForm(`/dashboard/tickets/${ticketId}/privacy/erase`, { _csrf: csrf });
+  const eraseRes = await adminClient.postForm(`/dashboard/tickets/${ticketId}/privacy/erase`, { _csrf: adminCsrf });
   assert.equal(eraseRes.status, 302);
 
   const erased = await db.prepare("SELECT * FROM tickets WHERE id = ?").get(ticketId);
@@ -291,6 +305,27 @@ test("GDPR export bundles a requester's tickets; erasure redacts identity, free 
   await assert.rejects(() => headBlob(attachmentRow.stored_name), /BlobNotFoundError|does not exist/);
   const remainingAttachments = await db.prepare("SELECT COUNT(*) c FROM attachments WHERE ticket_id = ?").get(ticketId);
   assert.equal(remainingAttachments.c, 0);
+});
+
+test("GDPR export/erase is admin-only, since it reaches every ticket a requester ever filed, not just this one", async () => {
+  const ticketId = await submitTicket({ requester_email: "non-admin-privacy-check@example.com" });
+
+  const exportRes = await client.get(`/dashboard/tickets/${ticketId}/privacy/export.json`);
+  assert.equal(exportRes.status, 403);
+
+  const ticketPage = await client.get(`/dashboard/tickets/${ticketId}`);
+  const csrf = extractCsrf(await ticketPage.text());
+  const eraseRes = await client.postForm(`/dashboard/tickets/${ticketId}/privacy/erase`, { _csrf: csrf });
+  assert.equal(eraseRes.status, 403);
+
+  // Nothing actually happened - the ticket is untouched.
+  const ticket = await db.prepare("SELECT requester_email, data_erased_at FROM tickets WHERE id = ?").get(ticketId);
+  assert.equal(ticket.requester_email, "non-admin-privacy-check@example.com");
+  assert.equal(ticket.data_erased_at, null);
+
+  // The ticket page itself shouldn't even offer the Export/Erase buttons to
+  // a non-admin.
+  assert.doesNotMatch(await ticketPage.text(), /privacy\/export\.json|privacy\/erase/);
 });
 
 test("Portuguese language toggle translates the public request form", async () => {

@@ -392,12 +392,13 @@
       </form>
     </div>
 
+    <% if (currentAgent.is_admin) { %>
     <div class="card">
       <h2>Requester data</h2>
       <% if (ticket.data_erased_at) { %>
         <p class="muted">Erased on <%= ticket.data_erased_at %>.</p>
       <% } else { %>
-        <p class="muted">GDPR export/erasure for <%= ticket.requester_email %>, across all of their tickets.</p>
+        <p class="muted">GDPR export/erasure for <%= ticket.requester_email %>, across all of their tickets. Admin-only, since it reaches every department they've filed a ticket in, not just this one.</p>
         <a class="button-secondary" href="/dashboard/tickets/<%= ticket.id %>/privacy/export.json">
           <span class="icon icon-download"></span>Export data
         </a>
@@ -411,6 +412,7 @@
         </form>
       <% } %>
     </div>
+    <% } %>
 
     <% if (otherTickets.length) { %>
       <div class="card">

@@ -2,7 +2,7 @@ const express = require("express");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const db = require("../db");
-const { requireAgent, requireAdmin } = require("../middleware/auth");
+const { requireAgent, requireAdmin, requireAdminWithMessage } = require("../middleware/auth");
 const { verifyCsrf } = require("../middleware/csrf");
 const { PRIORITIES, STATUSES, ASSET_CATEGORIES, ASSET_STATUSES, PAGE_SIZE } = require("../constants");
 const departments = require("../departments");
@@ -1020,7 +1020,23 @@ router.get("/tickets/:id/attachments/:attachmentId/preview", async (req, res, ne
 // GDPR export/erasure, scoped to this ticket's requester email and reachable
 // from the ticket detail page's "Requester data" card - there's no requester
 // login system in this app, so both are agent-initiated, not self-service.
-router.get("/tickets/:id/privacy/export.json", async (req, res, next) => {
+//
+// Admin-gated, deliberately more restrictive than every other ticket route
+// here: exportRequesterData/eraseRequesterData (src/privacy.js) pull or
+// mutate EVERY ticket that requester ever filed, in every department, not
+// just the one ticket in the URL. getTicketOr404's visibility check below
+// only confirms the acting agent can see *this* ticket - it says nothing
+// about the requester's other tickets in other departments, which could be
+// confidential HR/Legal history a regular agent has no business reaching.
+// Scoping the export/erasure itself to only the agent's visible tickets
+// instead was considered and rejected: a GDPR erasure that silently skips
+// data in other departments isn't actually erasure, it's a compliance gap
+// dressed up as one - requiring admin (who already bypasses department
+// scoping everywhere else) is the more honest fix.
+const REQUESTER_DATA_ADMIN_MESSAGE =
+  "Exporting or erasing a requester's data reaches every department they've filed a ticket in, not just this one - admin access is required.";
+
+router.get("/tickets/:id/privacy/export.json", requireAdminWithMessage(REQUESTER_DATA_ADMIN_MESSAGE), async (req, res, next) => {
   try {
     const ticket = await getTicketOr404(req, res, req.params.id);
     if (!ticket) return;
@@ -1034,20 +1050,25 @@ router.get("/tickets/:id/privacy/export.json", async (req, res, next) => {
   }
 });
 
-router.post("/tickets/:id/privacy/erase", verifyCsrf, async (req, res, next) => {
-  try {
-    const ticket = await getTicketOr404(req, res, req.params.id);
-    if (!ticket) return;
+router.post(
+  "/tickets/:id/privacy/erase",
+  requireAdminWithMessage(REQUESTER_DATA_ADMIN_MESSAGE),
+  verifyCsrf,
+  async (req, res, next) => {
+    try {
+      const ticket = await getTicketOr404(req, res, req.params.id);
+      if (!ticket) return;
 
-    const result = await eraseRequesterData(ticket.requester_email);
-    if (result.error) {
-      return res.status(400).render("error", { title: "Erasure failed", message: result.error });
+      const result = await eraseRequesterData(ticket.requester_email);
+      if (result.error) {
+        return res.status(400).render("error", { title: "Erasure failed", message: result.error });
+      }
+      res.redirect(`/dashboard/tickets/${ticket.id}`);
+    } catch (err) {
+      next(err);
     }
-    res.redirect(`/dashboard/tickets/${ticket.id}`);
-  } catch (err) {
-    next(err);
   }
-});
+);
 
 router.post("/tickets/:id/asset", verifyCsrf, async (req, res, next) => {
   try {

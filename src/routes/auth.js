@@ -8,6 +8,14 @@ const totp = require("../totp");
 
 const router = express.Router();
 
+// A fixed, valid bcrypt hash for a password nobody knows - compared against
+// whenever the submitted email doesn't match an active agent, so this route
+// takes about the same time either way. Without this, skipping bcrypt
+// entirely for "no such user" (near-instant) vs. actually running it for
+// "wrong password" (~100ms) lets an attacker enumerate valid agent emails
+// purely from response timing, even though both cases show the same error.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync("not-a-real-password", 10);
+
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
@@ -50,8 +58,9 @@ router.post("/login", loginLimiter, verifyCsrf, async (req, res, next) => {
       .get(normalizedEmail);
 
     const genericError = "Incorrect email or password.";
+    const passwordMatches = bcrypt.compareSync(password, agent ? agent.password_hash : DUMMY_PASSWORD_HASH);
 
-    if (!agent || !bcrypt.compareSync(password, agent.password_hash)) {
+    if (!agent || !passwordMatches) {
       await logLoginAttempt(req, { email: normalizedEmail, success: false });
       return res.status(401).render("auth/login", { title: "Log in", error: genericError, ssoEnabled: msSso.isEnabled() });
     }

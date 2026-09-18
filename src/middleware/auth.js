@@ -21,6 +21,20 @@ function requireAdmin(req, res, next) {
   });
 }
 
+// Same admin check as requireAdmin, with the wording overridden for routes
+// gated for a different reason than agent management - e.g. the GDPR
+// privacy export/erase routes below, which reach across every department a
+// requester has a ticket in, not just the one ticket a regular agent can
+// already see.
+function requireAdminWithMessage(message) {
+  return (req, res, next) => {
+    if (res.locals.currentAgent && res.locals.currentAgent.is_admin) {
+      return next();
+    }
+    return res.status(403).render("error", { title: "Admins only", message });
+  };
+}
+
 // Makes the logged-in agent (if any) available to every view as `currentAgent`.
 // Re-checks `active` on every request (not just at login) - deactivating an
 // agent should end their existing session immediately, not just block their
@@ -56,4 +70,4 @@ function attachAgent(db) {
   };
 }
 
-module.exports = { requireAgent, requireAdmin, attachAgent };
+module.exports = { requireAgent, requireAdmin, requireAdminWithMessage, attachAgent };
