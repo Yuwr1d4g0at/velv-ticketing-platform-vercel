@@ -4,7 +4,7 @@ const bcrypt = require("bcryptjs");
 const db = require("../db");
 const { requireAgent, requireAdmin, requireAdminWithMessage } = require("../middleware/auth");
 const { verifyCsrf } = require("../middleware/csrf");
-const { PRIORITIES, STATUSES, ASSET_CATEGORIES, ASSET_STATUSES, PAGE_SIZE } = require("../constants");
+const { PRIORITIES, STATUSES, ASSET_CATEGORIES, ASSET_STATUSES, CONSULTANT_STATUSES, PAGE_SIZE } = require("../constants");
 const departments = require("../departments");
 const {
   isAgingTicket,
@@ -21,6 +21,7 @@ const { toCsv } = require("../csv");
 const { addTagToTicket, removeTagFromTicket, tagsForTicket, allTags } = require("../tags");
 const canned = require("../canned-responses");
 const assets = require("../assets");
+const consultants = require("../consultants");
 const { exportRequesterData, eraseRequesterData } = require("../privacy");
 const { WEBHOOK_EVENTS, generateSecret, triggerWebhooks } = require("../webhooks");
 const { isUrlSafeForWebhook } = require("../urlSafety");
@@ -2163,6 +2164,216 @@ router.post("/assets/:id", verifyCsrf, async (req, res, next) => {
       });
     }
     res.redirect(`/dashboard/assets/${asset.id}`);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---- Consultants -----------------------------------------------------------
+// External consultants HR/Legal engage - modeled closely on the Assets
+// routes just above (CRUD, retire-not-delete via status, field-level change
+// history, CSV export), with strict department-scoped visibility (and a
+// confidential flag narrowing it further) layered on top - see
+// src/departments.js's canSeeConsultant/consultantVisibilitySql and its file
+// comment for why there is deliberately NO assignment/watcher carve-out.
+//
+// The single choke point for that visibility on one consultant by id -
+// every route below that operates on an existing consultant goes through
+// this, the same role getTicketOr404 plays for tickets. A consultant outside
+// the requesting agent's department (or hidden by its own confidential flag,
+// and not visible via is_admin/assignment) 404s exactly like one that
+// doesn't exist at all - never a distinguishable "forbidden".
+async function getConsultantOr404(req, res, id) {
+  const consultant = await consultants.get(id, res.locals.currentAgent);
+  if (!consultant) {
+    res.status(404).render("error", { title: "Not found", message: "That consultant does not exist." });
+    return null;
+  }
+  return consultant;
+}
+
+// Active agents eligible to be picked as the "assigned to" agent for a
+// consultant in `departmentId` - that department's own agents, plus every
+// admin (who can be assigned anything, same convention as
+// eligibleAgentsForCategory above for tickets).
+async function eligibleAgentsForDepartment(departmentId) {
+  return await db
+    .prepare("SELECT id, name FROM agents WHERE active = 1 AND (is_admin = 1 OR department_id = ?) ORDER BY name")
+    .all(departmentId);
+}
+
+router.get("/consultants", async (req, res, next) => {
+  try {
+    const { status = "", department_id = "", q = "" } = req.query;
+    const filters = { status, department_id, q };
+    const agent = res.locals.currentAgent;
+
+    const totalCount = await consultants.count(agent, filters);
+    const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+    const page = Math.min(Math.max(parseInt(req.query.page, 10) || 1, 1), totalPages);
+    const offset = (page - 1) * PAGE_SIZE;
+
+    const items = await consultants.all(agent, filters, { limit: PAGE_SIZE, offset });
+    res.render("dashboard/consultants", {
+      title: "Consultants",
+      wide: true,
+      items,
+      filters,
+      statuses: CONSULTANT_STATUSES,
+      departmentsList: agent.is_admin ? await departments.all() : null,
+      assignableAgents: agent.is_admin
+        ? await db.prepare("SELECT id, name FROM agents WHERE active = 1 ORDER BY name").all()
+        : await eligibleAgentsForDepartment(agent.department_id),
+      statusCounts: await consultants.countsByStatus(agent),
+      page,
+      totalPages,
+      totalCount,
+      values: {},
+      error: null,
+      exportQuery: new URLSearchParams(Object.fromEntries(Object.entries(filters).filter(([, v]) => v))).toString(),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/consultants", verifyCsrf, async (req, res, next) => {
+  try {
+    const agent = res.locals.currentAgent;
+    // Only an admin may pick a different department than their own - see
+    // src/consultants.js's create() comment on why this is resolved here,
+    // never trusted straight off req.body inside that function.
+    const requestedDepartmentId = agent.is_admin && req.body.department_id ? parseInt(req.body.department_id, 10) : null;
+    const departmentId = requestedDepartmentId || agent.department_id;
+
+    const result = await consultants.create(req.body, req.session.agentId, departmentId);
+    if (result.error) {
+      const filters = { status: "", department_id: "", q: "" };
+      const totalCount = await consultants.count(agent, filters);
+      return res.status(400).render("dashboard/consultants", {
+        title: "Consultants",
+        wide: true,
+        items: await consultants.all(agent, filters, { limit: PAGE_SIZE, offset: 0 }),
+        filters,
+        statuses: CONSULTANT_STATUSES,
+        departmentsList: agent.is_admin ? await departments.all() : null,
+        assignableAgents: agent.is_admin
+          ? await db.prepare("SELECT id, name FROM agents WHERE active = 1 ORDER BY name").all()
+          : await eligibleAgentsForDepartment(agent.department_id),
+        statusCounts: await consultants.countsByStatus(agent),
+        page: 1,
+        totalPages: Math.max(1, Math.ceil(totalCount / PAGE_SIZE)),
+        totalCount,
+        values: req.body,
+        error: result.error,
+        exportQuery: "",
+      });
+    }
+    res.redirect(`/dashboard/consultants/${result.id}`);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Mirrors /dashboard/assets/export.csv. Defined before /consultants/:id so
+// Express doesn't match "export.csv" as an :id first. Exports exactly the
+// currently-filtered, visibility-scoped set - never more than the list view
+// itself is showing.
+router.get("/consultants/export.csv", async (req, res, next) => {
+  try {
+    const { status = "", department_id = "", q = "" } = req.query;
+    const rows = await consultants.all(res.locals.currentAgent, { status, department_id, q });
+    const csv = toCsv(rows, [
+      { key: "id", header: "ID" },
+      { key: "name", header: "Name" },
+      { key: "company", header: "Company" },
+      { key: "specialty", header: "Specialty" },
+      { key: "email", header: "Email" },
+      { key: "phone", header: "Phone" },
+      { key: "department_name", header: "Department" },
+      { key: "status", header: "Status" },
+      { key: "engagement_start", header: "Engagement start" },
+      { key: "engagement_end", header: "Engagement end" },
+      { key: "rate", header: "Rate" },
+      { key: "assigned_to_name", header: "Assigned to" },
+    ]);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="consultants-${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/consultants/:id", async (req, res, next) => {
+  try {
+    const consultant = await getConsultantOr404(req, res, req.params.id);
+    if (!consultant) return;
+    res.render("dashboard/consultant", {
+      title: consultant.name,
+      consultant,
+      activity: await consultants.activityFor(consultant.id),
+      statuses: CONSULTANT_STATUSES,
+      departmentsList: res.locals.currentAgent.is_admin ? await departments.all() : null,
+      assignableAgents: await eligibleAgentsForDepartment(consultant.department_id),
+      error: null,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/consultants/:id", verifyCsrf, async (req, res, next) => {
+  try {
+    const consultant = await getConsultantOr404(req, res, req.params.id);
+    if (!consultant) return;
+
+    const agent = res.locals.currentAgent;
+    const requestedDepartmentId = agent.is_admin && req.body.department_id ? parseInt(req.body.department_id, 10) : null;
+
+    const result = await consultants.update(consultant.id, req.body, req.session.agentId, requestedDepartmentId);
+    if (result.error) {
+      return res.status(400).render("dashboard/consultant", {
+        title: consultant.name,
+        consultant: { ...consultant, ...req.body },
+        activity: await consultants.activityFor(consultant.id),
+        statuses: CONSULTANT_STATUSES,
+        departmentsList: agent.is_admin ? await departments.all() : null,
+        assignableAgents: await eligibleAgentsForDepartment(consultant.department_id),
+        error: result.error,
+      });
+    }
+    res.redirect(`/dashboard/consultants/${consultant.id}`);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Confidential is gated differently than the rest of a consultant's fields -
+// only an admin or the consultant's own assigned agent may toggle it, unlike
+// the ticket equivalent (anyone who can currently see the ticket). Anyone
+// else who can otherwise see this consultant gets a plain 403, not a 404 -
+// they're not being told the record doesn't exist, just that they can't
+// change this one flag on it.
+router.post("/consultants/:id/confidential", verifyCsrf, async (req, res, next) => {
+  try {
+    const consultant = await getConsultantOr404(req, res, req.params.id);
+    if (!consultant) return;
+
+    const agent = res.locals.currentAgent;
+    if (!agent.is_admin && consultant.assigned_to !== agent.id) {
+      return res.status(403).render("error", {
+        title: "Forbidden",
+        message: "Only an admin or this consultant's assigned agent can change the confidential flag.",
+      });
+    }
+
+    const confidential = req.body.confidential ? 1 : 0;
+    if (confidential !== consultant.confidential) {
+      await consultants.setConfidential(consultant.id, confidential, req.session.agentId);
+    }
+
+    res.redirect(`/dashboard/consultants/${consultant.id}`);
   } catch (err) {
     next(err);
   }

@@ -190,6 +190,35 @@ async function isEligibleAssignee(assignee, categoryName) {
   return assignee.department_id === (await departmentIdForCategory(categoryName));
 }
 
+// ---- Consultant visibility -------------------------------------------------
+
+// Same strict department-match model as canSeeTicket() above, applied to
+// consultants.department_id directly - no category indirection needed here,
+// a consultant stores its department id straight on the row. See the file
+// comment at the top for why there is deliberately NO assignment/watcher
+// carve-out for a regular agent - the same rule, the same reason, just a
+// different table. `agent` needs at least {id, department_id, is_admin};
+// `consultant` needs at least {department_id, confidential, assigned_to}.
+async function canSeeConsultant(agent, consultant) {
+  if (!agent) return false;
+  if (agent.is_admin) return true;
+  if (consultant.department_id !== agent.department_id) return false;
+  if (consultant.confidential) return consultant.assigned_to === agent.id;
+  return true;
+}
+
+// The SQL equivalent of canSeeConsultant(), for filtering a list/count/CSV
+// query at the database level - see ticketVisibilitySql()'s own comment for
+// the reasoning (unaliased `consultants` table assumed, empty fragment for
+// an admin, deliberately NOT async).
+function consultantVisibilitySql(agent) {
+  if (!agent || agent.is_admin) return { sql: "", params: [] };
+  return {
+    sql: ` AND consultants.department_id = ? AND (consultants.confidential = 0 OR consultants.assigned_to = ?)`,
+    params: [agent.department_id, agent.id],
+  };
+}
+
 module.exports = {
   all,
   allIncludingInactive,
@@ -209,4 +238,6 @@ module.exports = {
   canSeeTicket,
   ticketVisibilitySql,
   isEligibleAssignee,
+  canSeeConsultant,
+  consultantVisibilitySql,
 };

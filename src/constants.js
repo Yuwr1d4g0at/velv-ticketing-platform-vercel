@@ -19,10 +19,16 @@ const PAGE_SIZE = 25;
 const ASSET_CATEGORIES = ["Laptop", "Desktop", "Monitor", "Phone", "Server", "Network Equipment", "Peripheral", "Software License", "Other"];
 const ASSET_STATUSES = ["Available", "Reserved", "In Use", "In Storage", "Under Repair", "Retired", "Lost"];
 
+// Consultants (see src/consultants.js): retired, not deleted - a status
+// change to 'Ended' is how an engagement ends, the same "never a hard
+// DELETE" convention assets use with their own richer status set above.
+const CONSULTANT_STATUSES = ["Active", "Ended"];
+
 module.exports = {
   PRIORITIES,
   STATUSES,
   PAGE_SIZE,
   ASSET_CATEGORIES,
   ASSET_STATUSES,
+  CONSULTANT_STATUSES,
 };
