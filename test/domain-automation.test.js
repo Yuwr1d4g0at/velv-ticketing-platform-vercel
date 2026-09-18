@@ -7,18 +7,21 @@
 // tickets (src/checklists.js). The critical thing to prove here isn't just
 // "tickets get created" - it's that spawned tickets are strict, ordinary,
 // department-scoped tickets like any other: an IT ticket spawned by an HR
-// template is visible to IT agents and invisible to HR agents (beyond the
-// existing Link feature's own id/subject/status leak - see below), exactly
-// the same as if it had been filed directly into IT. This is the same
-// visibility boundary test/multi-department.test.js exists to guard, so
-// this file leans on the same "assert what's visible AND what's not"
-// shape rather than only checking the happy path.
+// template is visible to IT agents and invisible to HR agents, exactly the
+// same as if it had been filed directly into IT - including the Link
+// feature's own linkedTickets list on the HR ticket page, which used to
+// leak a linked ticket's subject/status across departments regardless of
+// who could actually see it (fixed in src/routes/dashboard.js's ticket
+// detail route). This is the same visibility boundary
+// test/multi-department.test.js exists to guard, so this file leans on the
+// same "assert what's visible AND what's not" shape rather than only
+// checking the happy path.
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
 const { startTestApp, makeClient, extractCsrf } = require("./helpers");
 
-let app, db, hrClient, itClient, marketingClient, legalClient;
+let app, db, hrClient, itClient, marketingClient, legalClient, adminClient;
 
 async function loginAs(c, email) {
   const loginPage = await c.get("/login");
@@ -39,15 +42,20 @@ before(async () => {
   await insertAgent.run("HR Agent", "hr-agent@domain-automation.example.com", passwordHash, 2);
   await insertAgent.run("Legal Agent", "legal-agent@domain-automation.example.com", passwordHash, 3);
   await insertAgent.run("Marketing Agent", "marketing-agent@domain-automation.example.com", passwordHash, 4);
+  await db
+    .prepare("INSERT INTO agents (name, email, password_hash, department_id, is_admin) VALUES (?, ?, ?, ?, 1)")
+    .run("Admin Agent", "admin-agent@domain-automation.example.com", passwordHash, 1);
 
   hrClient = makeClient(app.baseUrl);
   itClient = makeClient(app.baseUrl);
   legalClient = makeClient(app.baseUrl);
   marketingClient = makeClient(app.baseUrl);
+  adminClient = makeClient(app.baseUrl);
   await loginAs(hrClient, "hr-agent@domain-automation.example.com");
   await loginAs(itClient, "it-agent@domain-automation.example.com");
   await loginAs(legalClient, "legal-agent@domain-automation.example.com");
   await loginAs(marketingClient, "marketing-agent@domain-automation.example.com");
+  await loginAs(adminClient, "admin-agent@domain-automation.example.com");
 });
 
 after(() => app.close());
@@ -223,16 +231,22 @@ test("HR onboarding template spawns correctly-departmented IT and Marketing tick
   const linkedIds = links.map((l) => l.linked_ticket_id).sort((a, b) => a - b);
   assert.deepEqual(linkedIds.sort((a, b) => a - b), [itTicket.id, marketingTicket.id].sort((a, b) => a - b));
 
-  // NOTE / pre-existing behavior flagged, not fixed here: the HR agent's
-  // own ticket page DOES show the linked tickets' subject/status (Link's
-  // own linkedTickets query has no department filter - see
-  // src/checklists.js's header comment). That's Link's existing, already-
-  // shipped display behavior, unchanged by this feature; asserted here so
-  // a future change to Link's own visibility is a deliberate decision, not
-  // an accidental regression of this assertion.
+  // The linked-tickets list on the HR agent's own ticket page is now
+  // department-scoped like everything else (see dashboard.js's ticket
+  // detail route) - the spawned IT/Marketing tickets' subjects must NOT
+  // leak to HR just because they're linked. This was a real, previously
+  // flagged gap (Link's own linkedTickets query had no visibility filter);
+  // fixed alongside this test update.
   const hrTicketDetail = await (await hrClient.get(`/dashboard/tickets/${hrTicketId}`)).text();
-  assert.match(hrTicketDetail, /Configure PC for Jane Newhire/);
-  assert.match(hrTicketDetail, /Create profile picture for Jane Newhire/);
+  assert.doesNotMatch(hrTicketDetail, /Configure PC for Jane Newhire/);
+  assert.doesNotMatch(hrTicketDetail, /Create profile picture for Jane Newhire/);
+
+  // An admin viewing the same HR ticket still sees every linked ticket,
+  // regardless of department - admins bypass department scoping everywhere
+  // else in this app, and linked tickets are no exception.
+  const adminTicketDetail = await (await adminClient.get(`/dashboard/tickets/${hrTicketId}`)).text();
+  assert.match(adminTicketDetail, /Configure PC for Jane Newhire/);
+  assert.match(adminTicketDetail, /Create profile picture for Jane Newhire/);
 });
 
 test("template spawns are only applied when the submitted category matches the template's own category", async () => {

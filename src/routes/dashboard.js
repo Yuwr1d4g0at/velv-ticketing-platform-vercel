@@ -697,6 +697,16 @@ router.get("/tickets/:id", async (req, res, next) => {
       is_previewable: SAFE_PREVIEW_TYPES.has(a.mime_type),
     }));
     const rating = await db.prepare("SELECT rating, comment FROM ticket_ratings WHERE ticket_id = ?").get(ticket.id);
+    // Both queries below list OTHER tickets by subject/status, not just this
+    // one - getTicketOr404 above only ever checked visibility on the ticket
+    // in the URL, so without their own visibility filter these would leak a
+    // requester's or a linked ticket's subject/status across departments to
+    // any agent who can see this one ticket (not full ticket content, but a
+    // real leak once departments hold confidential HR/Legal data). Same
+    // ticketVisibilitySql() fragment the ticket list/CSV/reports use -
+    // references the unaliased `tickets` table both queries already expose.
+    const vis = departments.ticketVisibilitySql(res.locals.currentAgent);
+
     // Skipped once this ticket's own data has been erased - its requester_email
     // is now the same shared redaction placeholder every erased ticket gets,
     // so matching on it would incorrectly group unrelated erased requesters
@@ -706,19 +716,19 @@ router.get("/tickets/:id", async (req, res, next) => {
       : await db
           .prepare(
             `SELECT id, subject, status, created_at FROM tickets
-             WHERE requester_email = ? AND id != ?
+             WHERE requester_email = ? AND id != ?${vis.sql}
              ORDER BY created_at DESC`
           )
-          .all(ticket.requester_email, ticket.id);
+          .all(ticket.requester_email, ticket.id, ...vis.params);
 
     const linkedTickets = await db
       .prepare(
         `SELECT tickets.id, tickets.subject, tickets.status FROM ticket_links
          JOIN tickets ON tickets.id = ticket_links.linked_ticket_id
-         WHERE ticket_links.ticket_id = ?
+         WHERE ticket_links.ticket_id = ?${vis.sql}
          ORDER BY tickets.created_at DESC`
       )
-      .all(ticket.id);
+      .all(ticket.id, ...vis.params);
 
     // Skipped once this ticket's data has been erased (GDPR) - the stored
     // requester_email is the shared redaction placeholder by then, not a

@@ -92,7 +92,15 @@ async function applyTemplateSpawns({ templateId, originTicket, agentId }) {
     const spawnedId = result.lastInsertRowid;
 
     await insertActivity.run(spawnedId, agentId, `Created from ticket #${originTicket.id}'s onboarding checklist.`);
-    await insertActivity.run(originTicket.id, agentId, `Spawned ticket #${spawnedId} ("${subject}") from the onboarding checklist.`);
+    // No subject here, unlike the spawned ticket's own activity line above -
+    // this lands in the origin ticket's activity feed, which isn't
+    // department-filtered the way linkedTickets now is (see
+    // src/routes/dashboard.js's ticket detail route), so embedding the
+    // spawned ticket's subject would leak it to anyone who can see the
+    // origin ticket, regardless of whether they could see the spawned one.
+    // The ticket number alone is safe - clicking through still 404s for an
+    // out-of-department agent.
+    await insertActivity.run(originTicket.id, agentId, `Spawned ticket #${spawnedId} from the onboarding checklist.`);
 
     await insertLink.run(originTicket.id, spawnedId);
     await insertLink.run(spawnedId, originTicket.id);

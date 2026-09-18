@@ -93,13 +93,13 @@ async function agentId(email) {
 // Inserts a ticket directly (bypassing auto-assignment/round-robin, which
 // has its own dedicated test below) so each visibility test can set up
 // exactly the category/assignment/confidential combination it needs.
-async function createTicketDirect({ subject, category, assignedTo = null, confidential = 0 }) {
+async function createTicketDirect({ subject, category, assignedTo = null, confidential = 0, requesterEmail = "req@example.com" }) {
   const result = await db()
     .prepare(
       `INSERT INTO tickets (subject, description, category, requester_name, requester_email, assigned_to, confidential)
-       VALUES (?, 'desc', ?, 'Req', 'req@example.com', ?, ?)`
+       VALUES (?, 'desc', ?, 'Req', ?, ?, ?)`
     )
-    .run(subject, category, assignedTo, confidential);
+    .run(subject, category, requesterEmail, assignedTo, confidential);
   return result.lastInsertRowid;
 }
 
@@ -234,6 +234,47 @@ test("CSV export only includes the acting agent's own department's tickets", asy
   const csv = await (await itClient.get("/dashboard/export.csv")).text();
   assert.match(csv, /CSV IT ticket/);
   assert.doesNotMatch(csv, /CSV HR ticket/);
+});
+
+test("a ticket page's 'other tickets from this requester' and 'linked tickets' lists don't leak subject/status across departments", async () => {
+  // Same requester files an IT ticket and an HR ticket - before the fix,
+  // "other tickets" on the IT ticket's page (matched purely by
+  // requester_email, no department filter) would have shown the HR
+  // ticket's subject/status to the IT agent.
+  const itTicketId = await createTicketDirect({
+    subject: "Cross-dept requester IT ticket",
+    category: "Hardware",
+    requesterEmail: "cross-dept-requester@example.com",
+  });
+  const hrTicketId = await createTicketDirect({
+    subject: "Cross-dept requester HR ticket",
+    category: "Onboarding",
+    requesterEmail: "cross-dept-requester@example.com",
+  });
+
+  const itTicketDetail = await (await itClient.get(`/dashboard/tickets/${itTicketId}`)).text();
+  assert.doesNotMatch(itTicketDetail, /Cross-dept requester HR ticket/);
+
+  // Admin still sees it - "other tickets" isn't scoped away for the one
+  // role that's supposed to see everything.
+  const adminItTicketDetail = await (await adminClient.get(`/dashboard/tickets/${itTicketId}`)).text();
+  assert.match(adminItTicketDetail, /Cross-dept requester HR ticket/);
+
+  // Same story for the Link feature - link an IT and an HR ticket together
+  // (the app's ordinary cross-department Link, unrelated to "same
+  // requester"), and confirm the IT agent viewing their own ticket doesn't
+  // see the linked HR ticket's subject/status either.
+  const linkedItTicketId = await createTicketDirect({ subject: "Link target IT ticket", category: "Hardware" });
+  const linkedHrTicketId = await createTicketDirect({ subject: "Link target HR ticket", category: "Onboarding" });
+  await db()
+    .prepare("INSERT INTO ticket_links (ticket_id, linked_ticket_id) VALUES (?, ?), (?, ?)")
+    .run(linkedItTicketId, linkedHrTicketId, linkedHrTicketId, linkedItTicketId);
+
+  const linkedItTicketDetail = await (await itClient.get(`/dashboard/tickets/${linkedItTicketId}`)).text();
+  assert.doesNotMatch(linkedItTicketDetail, /Link target HR ticket/);
+
+  const adminLinkedItTicketDetail = await (await adminClient.get(`/dashboard/tickets/${linkedItTicketId}`)).text();
+  assert.match(adminLinkedItTicketDetail, /Link target HR ticket/);
 });
 
 test("dashboard full-text search never surfaces a result outside the acting agent's department", async () => {
