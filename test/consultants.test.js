@@ -137,6 +137,70 @@ test("creating a consultant validates required fields", async () => {
   assert.equal(res.status, 400);
 });
 
+test("creating a consultant rejects an invalid email, an invalid phone, and a start date after the end date", async () => {
+  const page = await hrClient.get("/dashboard/consultants");
+  const csrf = extractCsrf(await page.text());
+
+  const badEmail = await hrClient.postForm("/dashboard/consultants", { name: "Format Test", email: "not-an-email", _csrf: csrf });
+  assert.equal(badEmail.status, 400);
+  assert.match(await badEmail.text(), /valid email/);
+
+  const badPhone = await hrClient.postForm("/dashboard/consultants", { name: "Format Test", phone: "call-me-maybe", _csrf: csrf });
+  assert.equal(badPhone.status, 400);
+  assert.match(await badPhone.text(), /valid phone/);
+
+  const badRange = await hrClient.postForm("/dashboard/consultants", {
+    name: "Format Test",
+    engagement_start: "2027-06-01",
+    engagement_end: "2027-01-01",
+    _csrf: csrf,
+  });
+  assert.equal(badRange.status, 400);
+  assert.match(await badRange.text(), /start date must be on or before/);
+
+  // A legitimate-looking phone (spaces, +, parens, dashes) and a valid
+  // start<=end range both pass.
+  const good = await hrClient.postForm("/dashboard/consultants", {
+    name: "Format Test Valid",
+    email: "consultant@example.com",
+    phone: "+351 (21) 555-0100",
+    engagement_start: "2027-01-01",
+    engagement_end: "2027-06-01",
+    _csrf: csrf,
+  });
+  assert.equal(good.status, 302);
+});
+
+test("a consultant's assigned agent must belong to the consultant's own department", async () => {
+  const legalAgentId = await agentId("consultants-legal-agent@example.com");
+
+  const page = await hrClient.get("/dashboard/consultants");
+  const csrf = extractCsrf(await page.text());
+
+  // HR consultant, Legal agent - cross-department, must be rejected even
+  // though the Legal agent is perfectly valid and active.
+  const res = await hrClient.postForm("/dashboard/consultants", {
+    name: "Cross-Department Assignment",
+    assigned_to: String(legalAgentId),
+    _csrf: csrf,
+  });
+  assert.equal(res.status, 400);
+  assert.match(await res.text(), /own department/);
+
+  // Assigning an ADMIN agent, specifically, is fine regardless of
+  // department - departments.isEligibleConsultantAssignee bypasses for
+  // assignee.is_admin the same way isEligibleAssignee does for tickets.
+  // This is about the assignee's own role, not who's performing the
+  // request - a non-admin actor can still assign an admin colleague.
+  const adminAgentId = await agentId("consultants-admin-agent@example.com");
+  const adminAssigneeRes = await hrClient.postForm("/dashboard/consultants", {
+    name: "Admin Assignee Is Always Eligible",
+    assigned_to: String(adminAgentId),
+    _csrf: csrf,
+  });
+  assert.equal(adminAssigneeRes.status, 302);
+});
+
 test("editing a consultant persists changes and logs one activity row per changed field", async () => {
   const consultantId = await addConsultant(hrClient, { name: "Edit Test Consultant", company: "Acme Legal", rate: "$100/hr" });
 
@@ -320,4 +384,128 @@ test("confidential consultant in a different department still 404s for that depa
 
   const res = await hrClient.get(`/dashboard/consultants/${consultantId}`);
   assert.equal(res.status, 404, "department scoping must still win first - out-of-department is a 404, not a 403, regardless of confidentiality");
+});
+
+// ---- Engagement-ending reminders (src/consultantReminders.js) -------------
+// Mirrors src/contractReminders.js's own test shape (see
+// test/domain-automation.test.js) - idempotent alert, re-fires once the
+// underlying date genuinely changes, never re-sent otherwise.
+
+function isoDaysFromNow(days) {
+  return new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+test("consultant engagement reminder check emails once per consultant, and an engagement_end change lets it alert again", async () => {
+  const { checkConsultantEngagementReminders } = require("../src/consultantReminders");
+
+  const consultantId = await addConsultant(hrClient, { name: "Reminder Test Consultant" });
+
+  const detailPage = await hrClient.get(`/dashboard/consultants/${consultantId}`);
+  const csrf = extractCsrf(await detailPage.text());
+  await hrClient.postForm(`/dashboard/consultants/${consultantId}`, {
+    name: "Reminder Test Consultant",
+    status: "Active",
+    engagement_end: isoDaysFromNow(5),
+    _csrf: csrf,
+  });
+
+  const firstRun = await checkConsultantEngagementReminders();
+  assert.ok(firstRun >= 1);
+  let consultant = await db().prepare("SELECT engagement_end_alerted_at FROM consultants WHERE id = ?").get(consultantId);
+  assert.ok(consultant.engagement_end_alerted_at);
+
+  const secondRun = await checkConsultantEngagementReminders();
+  assert.equal(secondRun, 0); // already alerted, not re-sent
+
+  // Changing the engagement_end date clears the alert flag so it can fire
+  // again - same idea as assets.js's warranty_expires / contractReminders'
+  // reminder_date handling.
+  const detailPage2 = await hrClient.get(`/dashboard/consultants/${consultantId}`);
+  const editCsrf = extractCsrf(await detailPage2.text());
+  await hrClient.postForm(`/dashboard/consultants/${consultantId}`, {
+    name: "Reminder Test Consultant",
+    status: "Active",
+    engagement_end: isoDaysFromNow(400),
+    _csrf: editCsrf,
+  });
+  consultant = await db().prepare("SELECT engagement_end_alerted_at FROM consultants WHERE id = ?").get(consultantId);
+  assert.equal(consultant.engagement_end_alerted_at, null);
+});
+
+test("an 'Ended' consultant with an approaching engagement_end date is never alerted", async () => {
+  const { checkConsultantEngagementReminders } = require("../src/consultantReminders");
+
+  const consultantId = await createConsultantDirect({ name: "Already Ended Consultant", departmentId: 2, status: "Ended" });
+  await db().prepare("UPDATE consultants SET engagement_end = ? WHERE id = ?").run(isoDaysFromNow(2), consultantId);
+
+  await checkConsultantEngagementReminders();
+  const consultant = await db().prepare("SELECT engagement_end_alerted_at FROM consultants WHERE id = ?").get(consultantId);
+  assert.equal(consultant.engagement_end_alerted_at, null, "an already-ended engagement has nothing left to warn about");
+});
+
+test("a confidential consultant's engagement reminder never triggers the department-wide digest, even with an approaching date", async () => {
+  const { checkConsultantEngagementReminders } = require("../src/consultantReminders");
+
+  const consultantId = await createConsultantDirect({
+    name: "Confidential Ending Soon",
+    departmentId: 2,
+    confidential: 1,
+  });
+  await db().prepare("UPDATE consultants SET engagement_end = ? WHERE id = ?").run(isoDaysFromNow(5), consultantId);
+
+  const alertCount = await checkConsultantEngagementReminders();
+  assert.equal(alertCount, 0, "a confidential consultant must never be included in the department-wide digest count");
+
+  const consultant = await db().prepare("SELECT engagement_end_alerted_at FROM consultants WHERE id = ?").get(consultantId);
+  assert.equal(consultant.engagement_end_alerted_at, null, "never alerted means never marked alerted either - it stays eligible if it's ever made non-confidential");
+});
+
+// ---- Optimistic locking (src/consultants.js's update()) -------------------
+// now_text() (src/db/index.js) only has second-level precision, so a
+// timing-based test racing two real requests against the wall clock would
+// be flaky rather than actually broken - updated_at is set directly via
+// SQL to a deterministic value instead, same approach as
+// test/optimistic-locking.test.js's ticket-side tests.
+
+test("a stale expected_updated_at on the edit form is rejected and does not apply the change", async () => {
+  const consultantId = await addConsultant(hrClient, { name: "Lock Test Consultant", company: "Original Co" });
+
+  const page = await hrClient.get(`/dashboard/consultants/${consultantId}`);
+  const csrf = extractCsrf(await page.text());
+  const staleUpdatedAt = (await db().prepare("SELECT updated_at FROM consultants WHERE id = ?").get(consultantId)).updated_at;
+
+  await db().prepare("UPDATE consultants SET updated_at = '2099-01-01 00:00:00' WHERE id = ?").run(consultantId);
+
+  const res = await hrClient.postForm(`/dashboard/consultants/${consultantId}`, {
+    name: "Lock Test Consultant",
+    company: "Overwritten Co",
+    status: "Active",
+    expected_updated_at: staleUpdatedAt,
+    _csrf: csrf,
+  });
+  assert.equal(res.status, 400);
+  assert.match(await res.text(), /Someone else updated this consultant/);
+
+  const consultant = await db().prepare("SELECT company FROM consultants WHERE id = ?").get(consultantId);
+  assert.equal(consultant.company, "Original Co", "the stale request must not have changed the consultant");
+});
+
+test("submitting the consultant edit form with the current expected_updated_at succeeds", async () => {
+  const consultantId = await addConsultant(hrClient, { name: "Lock Test Consultant Two", company: "Original Co" });
+
+  const page = await hrClient.get(`/dashboard/consultants/${consultantId}`);
+  const csrf = extractCsrf(await page.text());
+  const current = (await db().prepare("SELECT updated_at FROM consultants WHERE id = ?").get(consultantId)).updated_at;
+
+  const res = await hrClient.postForm(`/dashboard/consultants/${consultantId}`, {
+    name: "Lock Test Consultant Two",
+    company: "Updated Co",
+    status: "Active",
+    expected_updated_at: current,
+    _csrf: csrf,
+  });
+  assert.equal(res.status, 302);
+
+  const consultant = await db().prepare("SELECT company FROM consultants WHERE id = ?").get(consultantId);
+  assert.equal(consultant.company, "Updated Co");
 });

@@ -24,6 +24,29 @@ const { CONSULTANT_STATUSES } = require("./constants");
 // POST /dashboard/consultants/:id/confidential in src/routes/dashboard.js.
 const FIELDS = ["name", "company", "specialty", "email", "phone", "status", "engagement_start", "engagement_end", "rate", "assigned_to", "notes"];
 
+// Same pattern src/routes/public.js and src/routes/dashboard.js already use
+// for a requester's email - deliberately permissive (this app has no need
+// to be the strict arbiter of what's a "real" email), just enough to catch
+// obvious garbage a direct POST bypassing the form's own type="email" could
+// otherwise store silently.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// No existing phone pattern anywhere else in this app to match - kept
+// intentionally loose (digits, spaces, and the punctuation a real phone
+// number legitimately uses) rather than inventing a strict international
+// format this app has no actual need to enforce.
+const PHONE_RE = /^[0-9+\-() .]+$/;
+
+// Shared by create() and update() so the two can't quietly drift on what
+// counts as valid. Returns an error string, or null if everything's fine.
+function validateFormat(values) {
+  if (values.email && !EMAIL_RE.test(values.email)) return "Enter a valid email address.";
+  if (values.phone && !PHONE_RE.test(values.phone)) return "Enter a valid phone number.";
+  if (values.engagement_start && values.engagement_end && values.engagement_start > values.engagement_end) {
+    return "Engagement start date must be on or before the engagement end date.";
+  }
+  return null;
+}
+
 // For readable audit-trail lines - "Status changed..." rather than "status
 // changed...". assigned_to is handled separately in update() below (it logs
 // agent *names*, not raw ids), so it has no entry here.
@@ -157,9 +180,13 @@ async function create(fields, agentId, departmentId) {
   const dept = await departments.get(departmentId);
   if (!dept) return { error: "Choose a valid department." };
   if (values.status && !CONSULTANT_STATUSES.includes(values.status)) return { error: "Choose a valid status." };
+  const formatError = validateFormat(values);
+  if (formatError) return { error: formatError };
   if (values.assigned_to) {
-    const assignee = await db.prepare("SELECT id FROM agents WHERE id = ? AND active = 1").get(values.assigned_to);
-    if (!assignee) return { error: "Choose a valid agent to assign." };
+    const assignee = await db.prepare("SELECT id, is_admin, department_id FROM agents WHERE id = ? AND active = 1").get(values.assigned_to);
+    if (!assignee || !departments.isEligibleConsultantAssignee(assignee, departmentId)) {
+      return { error: "Choose a valid agent to assign - they must be active and in this consultant's own department." };
+    }
   }
 
   const status = values.status || "Active";
@@ -197,14 +224,27 @@ async function update(id, fields, agentId, newDepartmentId = null) {
   const before = await db.prepare("SELECT * FROM consultants WHERE id = ?").get(id);
   if (!before) return { error: "Consultant not found." };
 
+  // Optimistic-locking check: the edit form embeds the consultant's
+  // updated_at as of when the page was loaded (expected_updated_at, see
+  // views/dashboard/consultant.ejs); `before` above is always read fresh,
+  // so a mismatch means a second agent's edit landed in between - reject
+  // rather than silently overwrite it last-write-wins. A request with no
+  // expected_updated_at (an older client, a direct API-style POST) is
+  // never treated as stale.
+  if (fields.expected_updated_at && fields.expected_updated_at !== before.updated_at) {
+    return { error: "Someone else updated this consultant since you loaded the page. Reload and try again." };
+  }
+
   const values = normalize(fields);
   if (!values.name) return { error: "Name is required." };
   if (!values.status || !CONSULTANT_STATUSES.includes(values.status)) return { error: "Choose a valid status." };
-  if (values.assigned_to) {
-    const assignee = await db.prepare("SELECT id FROM agents WHERE id = ? AND active = 1").get(values.assigned_to);
-    if (!assignee) return { error: "Choose a valid agent to assign." };
-  }
+  const formatError = validateFormat(values);
+  if (formatError) return { error: formatError };
 
+  // Resolved before the assignee check below, since eligibility depends on
+  // the FINAL department - an admin moving a consultant to a new
+  // department in the same request needs the assignee checked against
+  // where it's going, not where it currently is.
   let departmentId = before.department_id;
   if (newDepartmentId && newDepartmentId !== before.department_id) {
     const dept = await departments.get(newDepartmentId);
@@ -212,12 +252,26 @@ async function update(id, fields, agentId, newDepartmentId = null) {
     departmentId = newDepartmentId;
   }
 
+  if (values.assigned_to) {
+    const assignee = await db.prepare("SELECT id, is_admin, department_id FROM agents WHERE id = ? AND active = 1").get(values.assigned_to);
+    if (!assignee || !departments.isEligibleConsultantAssignee(assignee, departmentId)) {
+      return { error: "Choose a valid agent to assign - they must be active and in this consultant's own department." };
+    }
+  }
+
+  // Same idea as assets.js's warrantyChanged: a changed engagement_end date
+  // means any past "ending soon" alert (src/consultantReminders.js) was
+  // about the old date and no longer applies - clear it so a genuinely new
+  // date gets its own alert instead of staying silently suppressed by the
+  // old one.
+  const engagementEndChanged = (before.engagement_end || null) !== (values.engagement_end || null);
+
   await db
     .prepare(
       `UPDATE consultants SET
          name = ?, company = ?, specialty = ?, email = ?, phone = ?, department_id = ?,
          status = ?, engagement_start = ?, engagement_end = ?, rate = ?, assigned_to = ?,
-         notes = ?, updated_at = now_text()
+         notes = ?, updated_at = now_text()${engagementEndChanged ? ", engagement_end_alerted_at = NULL" : ""}
        WHERE id = ?`
     )
     .run(

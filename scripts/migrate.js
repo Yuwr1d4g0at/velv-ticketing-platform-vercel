@@ -258,6 +258,7 @@ const SCHEMA_SQL = `
     assigned_to        INTEGER REFERENCES agents(id) ON DELETE SET NULL,
     confidential       INTEGER NOT NULL DEFAULT 0,
     notes              TEXT,
+    engagement_end_alerted_at TEXT,
     created_at         TEXT NOT NULL DEFAULT ${NOW_TEXT},
     updated_at         TEXT NOT NULL DEFAULT ${NOW_TEXT}
   );
@@ -491,6 +492,12 @@ async function migrate() {
       ) STORED;
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_tickets_search_vector ON tickets USING GIN(search_vector);`);
+
+    // Same reasoning as search_vector above - patches a consultants table
+    // that already existed (e.g. an earlier test run against this same
+    // database) before engagement_end_alerted_at was added to the CREATE
+    // TABLE, so src/consultantReminders.js's query doesn't 42703 on it.
+    await client.query(`ALTER TABLE consultants ADD COLUMN IF NOT EXISTS engagement_end_alerted_at TEXT;`);
 
     // Same seed-if-empty data as the old src/db/index.js - historical
     // defaults, never re-applied once a real row exists.

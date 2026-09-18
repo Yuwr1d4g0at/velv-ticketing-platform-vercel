@@ -16,6 +16,7 @@ const sessionStore = require("./sessionStore");
 const { checkSlaBreaches, checkFirstResponseBreaches } = require("./sla");
 const { checkWarrantyAlerts } = require("./warranty");
 const { checkContractReminders } = require("./contractReminders");
+const { checkConsultantEngagementReminders } = require("./consultantReminders");
 const { runDueRecurringTickets } = require("./recurring");
 const { sendDueDigests } = require("./digest");
 const assetSync = require("./assetSync");
@@ -54,6 +55,7 @@ async function runPeriodicChecks() {
   await checkFirstResponseBreaches().catch((err) => console.error("First-response breach check failed:", err.message));
   await checkWarrantyAlerts().catch((err) => console.error("Warranty alert check failed:", err.message));
   await checkContractReminders().catch((err) => console.error("Contract reminder check failed:", err.message));
+  await checkConsultantEngagementReminders().catch((err) => console.error("Consultant engagement reminder check failed:", err.message));
   await runDueRecurringTickets().catch((err) => console.error("Recurring ticket check failed:", err.message));
   await sendDueDigests().catch((err) => console.error("Daily digest check failed:", err.message));
   await pruneExpiredSessions();

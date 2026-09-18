@@ -190,6 +190,19 @@ async function isEligibleAssignee(assignee, categoryName) {
   return assignee.department_id === (await departmentIdForCategory(categoryName));
 }
 
+// Same rule as isEligibleAssignee above, for consultants - which store
+// department_id directly on the row (no category indirection to resolve
+// through), so this takes it as-is rather than looking it up. Not itself a
+// visibility check (canSeeConsultant/consultantVisibilitySql already gate
+// that independently and win first) - this is a data-integrity rule: a
+// consultant's assigned_to should actually belong to its own department,
+// same as a ticket's assignee has to belong to the ticket's department.
+function isEligibleConsultantAssignee(assignee, departmentId) {
+  if (!assignee) return false;
+  if (assignee.is_admin) return true;
+  return assignee.department_id === departmentId;
+}
+
 // ---- Consultant visibility -------------------------------------------------
 
 // Same strict department-match model as canSeeTicket() above, applied to
@@ -238,6 +251,7 @@ module.exports = {
   canSeeTicket,
   ticketVisibilitySql,
   isEligibleAssignee,
+  isEligibleConsultantAssignee,
   canSeeConsultant,
   consultantVisibilitySql,
 };

@@ -192,6 +192,22 @@ function sendContractReminderDigest({ to, tickets }) {
   );
 }
 
+// One digest per agent listing every consultant in their own department
+// whose engagement is about to end - see src/consultantReminders.js for
+// when this fires and why it's scoped per-department (consultants have a
+// real department_id, unlike tickets' derived-from-category one).
+function sendConsultantEngagementEndingDigest({ to, consultants }) {
+  const lines = consultants
+    .map((c) => `- ${c.name}${c.company ? ` (${c.company})` : ""} - engagement ends ${c.engagement_end}`)
+    .join("\n");
+  return send(
+    to,
+    `Consultant engagement ending soon: ${consultants.length} consultant${consultants.length === 1 ? "" : "s"}`,
+    `${lines}\n\n${APP_URL ? `${APP_URL}/dashboard/consultants` : "Check the dashboard"} for details.\n\n` +
+      `Our Team. Remotely Yours.\nVelv`
+  );
+}
+
 // A scheduled job (see src/routes/cron.js) threw instead of completing -
 // otherwise this would only ever surface in Vercel's own function logs,
 // which nobody's watching day to day. Goes to every active admin, not the
@@ -220,5 +236,6 @@ module.exports = {
   sendLowRatingEscalation,
   sendWarrantyExpiryDigest,
   sendContractReminderDigest,
+  sendConsultantEngagementEndingDigest,
   sendCronFailureAlert,
 };
