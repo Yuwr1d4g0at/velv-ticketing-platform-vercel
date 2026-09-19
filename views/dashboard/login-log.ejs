@@ -1,4 +1,7 @@
 <%- include('../partials/header') %>
+<div class="settings-layout">
+  <%- include('../partials/settings-nav', { active: 'login-log' }) %>
+  <div class="settings-content">
 <h1>Login activity</h1>
 <p class="muted">The most recent 200 login attempts, successful or not - useful for spotting a compromised account or a brute-force run.</p>
 
@@ -60,5 +63,7 @@
       <% }) %>
     </tbody>
   </table>
+</div>
+  </div>
 </div>
 <%- include('../partials/footer') %>

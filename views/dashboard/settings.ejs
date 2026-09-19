@@ -1,28 +1,32 @@
 <%- include('../partials/header') %>
-<h1>Settings</h1>
-<p class="muted">Also see <a href="/dashboard/settings/departments">Departments &amp; categories</a>, <a href="/dashboard/settings/webhooks">Webhooks</a>, <a href="/dashboard/settings/login-log">Login activity</a>, <a href="/dashboard/settings/custom-fields">Custom fields</a>, <a href="/dashboard/recurring">Recurring tickets</a>, <a href="/dashboard/settings/automation">Automation rules</a>, <a href="/dashboard/settings/holidays">Company holidays</a>, <a href="/dashboard/settings/asset-sync">Asset inventory sync</a>, and <a href="/dashboard/settings/security">Two-factor authentication</a>.</p>
+<div class="settings-layout">
+  <%- include('../partials/settings-nav', { active: 'thresholds' }) %>
+  <div class="settings-content">
+    <h1>Aging thresholds</h1>
 
-<div class="card card-medium">
-  <h2>Aging thresholds</h2>
-  <p class="muted">A still-open ticket older than this, for its priority, gets flagged "Aging" on the dashboard and triggers an SLA breach email (if notifications are configured).</p>
-  <% if (error) { %>
-    <div class="alert alert-error" role="alert"><span class="icon icon-alert-triangle"></span><%= error %></div>
-  <% } %>
-  <form action="/dashboard/settings" method="POST" class="stacked-form">
-    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
-    <% priorities.forEach(function(p) { %>
-      <label for="days_<%= p %>"><%= p %> (days)</label>
-      <input type="number" id="days_<%= p %>" name="days_<%= p %>" min="1" max="365" required value="<%= thresholds[p] %>">
-    <% }) %>
+    <div class="card card-medium">
+      <h2>Resolution thresholds</h2>
+      <p class="muted">A still-open ticket older than this, for its priority, gets flagged "Aging" on the dashboard and triggers an SLA breach email (if notifications are configured).</p>
+      <% if (error) { %>
+        <div class="alert alert-error" role="alert"><span class="icon icon-alert-triangle"></span><%= error %></div>
+      <% } %>
+      <form action="/dashboard/settings" method="POST" class="stacked-form">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <% priorities.forEach(function(p) { %>
+          <label for="days_<%= p %>"><%= p %> (days)</label>
+          <input type="number" id="days_<%= p %>" name="days_<%= p %>" min="1" max="365" required value="<%= thresholds[p] %>">
+        <% }) %>
 
-    <h3>First-response targets</h3>
-    <p class="muted">A separate, usually tighter target for time-to-first-response (any agent activity on the ticket) - its own SLA breach email if missed, independent of the resolution threshold above.</p>
-    <% priorities.forEach(function(p) { %>
-      <label for="fr_hours_<%= p %>"><%= p %> (hours)</label>
-      <input type="number" id="fr_hours_<%= p %>" name="fr_hours_<%= p %>" min="1" max="720" required value="<%= frThresholds[p] %>">
-    <% }) %>
+        <h3>First-response targets</h3>
+        <p class="muted">A separate, usually tighter target for time-to-first-response (any agent activity on the ticket) - its own SLA breach email if missed, independent of the resolution threshold above.</p>
+        <% priorities.forEach(function(p) { %>
+          <label for="fr_hours_<%= p %>"><%= p %> (hours)</label>
+          <input type="number" id="fr_hours_<%= p %>" name="fr_hours_<%= p %>" min="1" max="720" required value="<%= frThresholds[p] %>">
+        <% }) %>
 
-    <button type="submit" class="button-primary">Save thresholds</button>
-  </form>
+        <button type="submit" class="button-primary">Save thresholds</button>
+      </form>
+    </div>
+  </div>
 </div>
 <%- include('../partials/footer') %>

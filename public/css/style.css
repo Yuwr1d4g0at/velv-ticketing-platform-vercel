@@ -394,6 +394,53 @@ hr { border: none; border-top: 1px solid var(--border-subtle); margin: var(--spa
 .notif-item .notif-time { display: block; color: var(--text-muted); font-size: var(--fs-caption); margin-top: 2px; }
 .notif-empty { padding: var(--space-4); color: var(--text-muted); text-align: center; font-size: var(--fs-body-sm); }
 
+/* "More" nav menu (Agents/Canned responses/Knowledge base/Settings) - same
+   <details>/<summary> pattern as .notif-bell, no JS needed. Keeps the
+   header down to Dashboard/Assets/Consultants plus this one grouped menu
+   for everything used less often, instead of a flat row that grows by one
+   link every time a new settings-adjacent page is added. */
+.nav-more { position: relative; }
+.nav-more > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-body);
+  font-weight: var(--fw-medium);
+  font-size: var(--fs-body-sm);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-pill);
+}
+.nav-more > summary::-webkit-details-marker { display: none; }
+.nav-more > summary:hover { background: var(--velv-purple-050); }
+[data-theme="dark"] .nav-more > summary:hover { background: rgba(255, 255, 255, 0.08); }
+.nav-more[open] > summary .nav-more-caret { transform: rotate(180deg); }
+.nav-more-caret { display: inline-block; font-size: 0.7em; transition: transform var(--dur-base) var(--ease-out); }
+.nav-more-dropdown {
+  position: absolute;
+  left: 0;
+  top: calc(100% + var(--space-2));
+  min-width: 200px;
+  background: var(--surface-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  z-index: 50;
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.nav-more-dropdown a {
+  color: var(--text-body);
+  font-size: var(--fs-body-sm);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+}
+.nav-more-dropdown a:hover { background: var(--velv-ink-100); text-decoration: none; }
+[data-theme="dark"] .nav-more-dropdown a:hover { background: rgba(255, 255, 255, 0.08); }
+
 .link-button {
   background: none;
   border: none;
@@ -1277,9 +1324,64 @@ form.split-layout.stacked-form { display: grid; max-width: none; }
    utility class since CSP has no unsafe-inline for style-src. */
 .watching-card { margin-top: var(--space-6); }
 
+/* ============================================================
+   Settings sidebar (views/partials/settings-nav.ejs)
+   ============================================================
+   Every /dashboard/settings* page (plus /dashboard/recurring, which lives
+   under this same umbrella) wraps its content in .settings-layout so the
+   sidebar stays put across all ten of them instead of each page linking
+   sideways to the others in a paragraph of prose. Same fixed-sidebar +
+   fluid-content shape as .ticket-grid, just a narrower first column since
+   this one is nav links, not a data panel. */
+.settings-layout { display: grid; grid-template-columns: 220px 1fr; gap: var(--space-6); align-items: start; }
+.settings-content > h1:first-child { margin-top: 0; }
+
+.settings-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  position: sticky;
+  top: var(--space-5);
+}
+.settings-nav-group { display: flex; flex-direction: column; gap: 2px; }
+.settings-nav-label {
+  font-size: var(--fs-overline);
+  font-weight: var(--fw-medium);
+  letter-spacing: var(--ls-overline);
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0 0 var(--space-2) var(--space-3);
+}
+.settings-sidebar a {
+  color: var(--text-body);
+  font-size: var(--fs-body-sm);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+}
+.settings-sidebar a:hover { background: var(--velv-purple-050); text-decoration: none; }
+[data-theme="dark"] .settings-sidebar a:hover { background: rgba(255, 255, 255, 0.08); }
+.settings-sidebar a.is-active {
+  background: var(--velv-purple-050);
+  color: var(--velv-electric);
+  font-weight: var(--fw-medium);
+}
+[data-theme="dark"] .settings-sidebar a.is-active { background: rgba(130, 118, 241, 0.16); color: var(--velv-light-purple); }
+
 @media (max-width: 800px) {
   .ticket-grid { grid-template-columns: 1fr; }
   .form-row { flex-direction: column; }
+  .settings-layout { grid-template-columns: 1fr; }
+  .settings-sidebar {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-4);
+    padding-bottom: var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+    margin-bottom: var(--space-2);
+  }
+  .settings-nav-group { flex-direction: row; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+  .settings-nav-label { margin: 0; }
 }
 
 .activity-feed { list-style: none; margin: 0 0 var(--space-5); padding: 0; display: flex; flex-direction: column; gap: var(--space-3); }

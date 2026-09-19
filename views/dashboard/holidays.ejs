@@ -1,4 +1,7 @@
 <%- include('../partials/header') %>
+<div class="settings-layout">
+  <%- include('../partials/settings-nav', { active: 'holidays' }) %>
+  <div class="settings-content">
 <h1>Company holidays</h1>
 <p class="muted">Days the business-hours aging/SLA clock treats as non-working, exactly like a weekend, on top of the fixed Mon&ndash;Fri 09:00&ndash;18:00 window.</p>
 
@@ -46,5 +49,7 @@
 
     <button type="submit" class="button-primary">Add holiday</button>
   </form>
+</div>
+  </div>
 </div>
 <%- include('../partials/footer') %>

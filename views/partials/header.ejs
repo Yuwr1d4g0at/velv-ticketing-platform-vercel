@@ -29,12 +29,17 @@
             <a href="/dashboard">Dashboard</a>
             <a href="/dashboard/assets">Assets</a>
             <a href="/dashboard/consultants">Consultants</a>
-            <% if (currentAgent.is_admin) { %>
-              <a href="/dashboard/agents">Agents</a>
-            <% } %>
-            <a href="/dashboard/canned-responses">Responses</a>
-            <a href="/dashboard/kb">Knowledge base</a>
-            <a href="/dashboard/settings">Settings</a>
+            <details class="nav-more">
+              <summary>More <span class="nav-more-caret" aria-hidden="true">&#9662;</span></summary>
+              <div class="nav-more-dropdown">
+                <% if (currentAgent.is_admin) { %>
+                  <a href="/dashboard/agents">Agents</a>
+                <% } %>
+                <a href="/dashboard/canned-responses">Canned responses</a>
+                <a href="/dashboard/kb">Knowledge base</a>
+                <a href="/dashboard/settings">Settings</a>
+              </div>
+            </details>
             <details class="notif-bell" data-csrf="<%= csrfToken %>">
               <summary aria-label="Notifications">
                 <span class="icon icon-bell"></span>

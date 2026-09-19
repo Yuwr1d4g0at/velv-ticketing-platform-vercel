@@ -1,4 +1,7 @@
 <%- include('../partials/header') %>
+<div class="settings-layout">
+  <%- include('../partials/settings-nav', { active: 'custom-fields' }) %>
+  <div class="settings-content">
 <h1>Custom fields</h1>
 <p class="muted">A field scoped to one category only - shown on the public form, agent-initiated tickets, and the ticket detail page whenever that category's selected.</p>
 
@@ -49,5 +52,7 @@
 
     <button type="submit" class="button-primary">Add field</button>
   </form>
+</div>
+  </div>
 </div>
 <%- include('../partials/footer') %>

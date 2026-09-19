@@ -1,4 +1,7 @@
 <%- include('../partials/header') %>
+<div class="settings-layout">
+  <%- include('../partials/settings-nav', { active: 'recurring' }) %>
+  <div class="settings-content">
 <h1>Recurring tickets</h1>
 <p class="muted">Auto-creates a new ticket on a fixed schedule (e.g. "monthly server check") instead of someone remembering to file it by hand.</p>
 
@@ -73,5 +76,7 @@
 
     <button type="submit" class="button-primary">Add recurring ticket</button>
   </form>
+</div>
+  </div>
 </div>
 <%- include('../partials/footer') %>

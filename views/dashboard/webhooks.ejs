@@ -1,4 +1,7 @@
 <%- include('../partials/header') %>
+<div class="settings-layout">
+  <%- include('../partials/settings-nav', { active: 'webhooks' }) %>
+  <div class="settings-content">
 <h1>Webhooks</h1>
 <p class="muted">POST a signed JSON payload to a URL you choose when something happens. Each payload is signed with that webhook's own secret (HMAC-SHA256, in an <code>X-Velv-Signature</code> header) so the receiving end can verify it actually came from here.</p>
 
@@ -65,5 +68,7 @@
 
     <button type="submit" class="button-primary">Add webhook</button>
   </form>
+</div>
+  </div>
 </div>
 <%- include('../partials/footer') %>

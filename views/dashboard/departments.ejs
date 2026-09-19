@@ -1,4 +1,7 @@
 <%- include('../partials/header') %>
+<div class="settings-layout">
+  <%- include('../partials/settings-nav', { active: 'departments' }) %>
+  <div class="settings-content">
 <h1>Departments &amp; categories</h1>
 <p class="muted">Every agent belongs to exactly one department; every ticket category belongs to exactly one department. Together they're what scopes a regular agent to only their own department's tickets, KB articles, canned responses, and reports - see the Agents page for the one bypass (admin). Neither is ever hard-deleted - deactivate one instead if it's no longer in use.</p>
 
@@ -99,5 +102,7 @@
 
     <button type="submit" class="button-primary">Add category</button>
   </form>
+</div>
+  </div>
 </div>
 <%- include('../partials/footer') %>

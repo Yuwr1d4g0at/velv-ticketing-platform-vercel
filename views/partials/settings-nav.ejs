@@ -1,0 +1,54 @@
+<%
+// Shared sidebar for every /dashboard/settings* page (plus /dashboard/recurring,
+// which lives under the Settings umbrella in spirit even though its route
+// doesn't). Each caller passes `active` - one of the data-key values below -
+// so its own link gets .is-active; nothing else about the page needs to know
+// this list exists.
+const settingsGroups = [
+  {
+    label: "General",
+    links: [
+      { key: "thresholds", href: "/dashboard/settings", label: "Aging thresholds" },
+      { key: "holidays", href: "/dashboard/settings/holidays", label: "Company holidays" },
+    ],
+  },
+  {
+    label: "Workflow",
+    links: [
+      { key: "automation", href: "/dashboard/settings/automation", label: "Automation rules" },
+      { key: "recurring", href: "/dashboard/recurring", label: "Recurring tickets" },
+      { key: "custom-fields", href: "/dashboard/settings/custom-fields", label: "Custom fields" },
+    ],
+  },
+  {
+    label: "Organization",
+    links: [
+      { key: "departments", href: "/dashboard/settings/departments", label: "Departments & categories" },
+    ],
+  },
+  {
+    label: "Integrations",
+    links: [
+      { key: "webhooks", href: "/dashboard/settings/webhooks", label: "Webhooks" },
+      { key: "asset-sync", href: "/dashboard/settings/asset-sync", label: "Asset inventory sync" },
+    ],
+  },
+  {
+    label: "Security",
+    links: [
+      { key: "security", href: "/dashboard/settings/security", label: "Two-factor authentication" },
+      { key: "login-log", href: "/dashboard/settings/login-log", label: "Login activity" },
+    ],
+  },
+];
+%>
+<nav class="settings-sidebar" aria-label="Settings">
+  <% settingsGroups.forEach(function(group) { %>
+    <div class="settings-nav-group">
+      <p class="settings-nav-label"><%= group.label %></p>
+      <% group.links.forEach(function(link) { %>
+        <a href="<%= link.href %>" class="<%= typeof active !== 'undefined' && active === link.key ? 'is-active' : '' %>"<%= typeof active !== 'undefined' && active === link.key ? ' aria-current="page"' : '' %>><%= link.label %></a>
+      <% }) %>
+    </div>
+  <% }) %>
+</nav>

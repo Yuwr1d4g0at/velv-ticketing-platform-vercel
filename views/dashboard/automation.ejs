@@ -1,4 +1,7 @@
 <%- include('../partials/header') %>
+<div class="settings-layout">
+  <%- include('../partials/settings-nav', { active: 'automation' }) %>
+  <div class="settings-content">
 <h1>Automation rules</h1>
 <p class="muted">Runs once, automatically, the moment a ticket is submitted through the public request form - not on agent-initiated tickets, and not re-evaluated on later edits. At least one condition and one action is required per rule; every matching rule's actions all apply.</p>
 
@@ -96,5 +99,7 @@
 
     <button type="submit" class="button-primary">Add rule</button>
   </form>
+</div>
+  </div>
 </div>
 <%- include('../partials/footer') %>

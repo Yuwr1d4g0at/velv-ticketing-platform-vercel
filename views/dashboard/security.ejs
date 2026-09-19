@@ -1,4 +1,7 @@
 <%- include('../partials/header') %>
+<div class="settings-layout">
+  <%- include('../partials/settings-nav', { active: 'security' }) %>
+  <div class="settings-content">
 <h1>Two-factor authentication</h1>
 <p class="muted">Adds a 6-digit code from an authenticator app as a second step after your password when logging in. Optional, and only for your own account - if you lose your device, an admin can reset it for you from the Agents page.</p>
 
@@ -47,5 +50,7 @@
       <button type="submit" class="button-primary">Set up two-factor authentication</button>
     </form>
   <% } %>
+</div>
+  </div>
 </div>
 <%- include('../partials/footer') %>

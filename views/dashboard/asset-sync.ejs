@@ -1,4 +1,7 @@
 <%- include('../partials/header') %>
+<div class="settings-layout">
+  <%- include('../partials/settings-nav', { active: 'asset-sync' }) %>
+  <div class="settings-content">
 <h1>Asset inventory sync</h1>
 <p class="muted">Pulls the hardware inventory from SharePoint via Microsoft Graph, on a schedule - see the README for how the sync is scoped and which fields SharePoint owns.</p>
 
@@ -42,5 +45,7 @@
       <% }) %>
     </tbody>
   </table>
+</div>
+  </div>
 </div>
 <%- include('../partials/footer') %>
